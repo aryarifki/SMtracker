@@ -73,7 +73,7 @@ if __name__ == "__main__":
         
         print("🔄 Memulai sinkronisasi harian terbaru...")
         # Mode run() ini setara dengan tombol "Run latest pipeline to today" di dashboard Anda
-        result = pipeline.run(universe_mode="all", price_period="5d")
+        result = pipeline.run(universe_mode="all", price_period="3d")
         
         print(f"🎉 Eksekusi harian selesai! Tersimpan: {result['n_broker']} broker rows, {result.get('n_activity', 0)} activity rows.")
     else:

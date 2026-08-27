@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 import os
 import sys
+from datetime import date, timedelta
 from pathlib import Path
 from dotenv import set_key, load_dotenv
 from playwright.sync_api import sync_playwright
 
 _ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(_ROOT / "src")) # Pastikan folder src terbaca
+sys.path.insert(0, str(_ROOT / "src"))
 
 _ENV_PATH = _ROOT / ".env"
 _SESSION_DIR = _ROOT / "browser_session" 
@@ -69,13 +70,26 @@ if __name__ == "__main__":
         from idx_bandarmology import config, pipeline, broker_api
         
         config.BROKER_API_TOKEN = new_token
-        broker_api.set_rate_limit(12.0) # Rate limit agresif
+        broker_api.set_rate_limit(12.0)
         
-        print("🔄 Memulai sinkronisasi harian terbaru...")
-        # Mode run() ini setara dengan tombol "Run latest pipeline to today" di dashboard Anda
-        result = pipeline.run(universe_mode="all", price_period="3d")
+        print("\n🔄 Memulai sinkronisasi harian cerdas (Mesin Backfill H-2)...")
         
-        print(f"🎉 Eksekusi harian selesai! Tersimpan: {result['n_broker']} broker rows, {result.get('n_activity', 0)} activity rows.")
+        # Tentukan rentang waktu secara dinamis: H-2 hingga Hari Ini
+        end_d = date.today()
+        start_d = end_d - timedelta(days=2)
+        
+        # Menggunakan mesin backfill_broker_history yang 3x lebih ringan dan bisa melewati data yang sudah ada
+        try:
+            result = pipeline.backfill_broker_history(
+                universe_mode="all", 
+                start_date=start_d, 
+                end_date=end_d, 
+                refresh_prices=True, 
+                price_period="5d"
+            )
+            print(f"🎉 Eksekusi harian selesai! Tersimpan: {result['n_broker']} baris broker.")
+        except Exception as e:
+            print(f"❌ Terjadi kesalahan saat pipeline berjalan: {e}")
     else:
         print("❌ Gagal mendapatkan token.")
         sys.exit(1)

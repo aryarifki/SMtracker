@@ -420,7 +420,6 @@ def _flow_row(sym: str, md: dict[str, Any], fallback_date: str, fetched_at: str)
 
 
 # ── section: foreign vs domestic flow ────────────────────────────────────────
-
 def _foreign_domestic_section(sym: str) -> dict[str, Any]:
     fd = _get(f"/findata-view/foreign-domestic/v1/chart-data/{sym}").get("data", {}) or {}
     val = fd.get("value", {}) or {}
@@ -495,7 +494,10 @@ def fetch_historical_broker_flow(
         sym, iso = task
         try:
             md = _md_range(sym, iso, iso)
-        except Exception:
+        except Exception as exc:
+            error_msg = str(exc).lower()
+            if any(k in error_msg for k in ["401", "403", "unauthorized", "forbidden", "timeout", "connection", "read"]):
+                raise exc
             return None
         return _flow_row(sym, md, iso, fetched_at)
 
@@ -588,6 +590,9 @@ def fetch_historical_broker_data(
         try:
             md = _md_range(sym, iso, iso)
         except Exception as exc:  # noqa: BLE001
+            error_msg = str(exc).lower()
+            if any(k in error_msg for k in ["401", "403", "unauthorized", "forbidden", "timeout", "connection", "read"]):
+                raise exc
             if len(errors) < 8:
                 errors.append(f"{sym} {iso}: {type(exc).__name__}: {str(exc)[:140]}")
             return None, []

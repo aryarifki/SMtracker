@@ -140,11 +140,28 @@ def auto_renew_token() -> bool:
                 page.locator('input[id="password"], input[type="password"], input[name="password"]').first.fill(password)
                 page.locator('button[type="submit"], input[type="submit"], button:has-text("Log In")').first.click()
                 
-                for _ in range(30):
-                    if captured_token: break
+                print("\n   🚨 PERHATIAN: Silakan cek aplikasi Stockbit / HP Anda sekarang!")
+                print("   ⏳ Menunggu Anda melakukan autentikasi perangkat (Batas waktu: 2 menit)...")
+                
+                for _ in range(60):
+                    if captured_token: 
+                        print("   ✅ Autentikasi sukses! Token baru berhasil ditangkap.")
+                        break
                     page.wait_for_timeout(2000)
+                
+                # --- Fitur Tambahan: Screenshot Otomatis jika gagal ---
+                if not captured_token:
+                    print("\n   ❌ Waktu habis. Autentikasi tidak diselesaikan atau gagal.")
+                    page.screenshot(path="/opt/SMtracker/debug_backfill_login.png")
+                    print("   📸 Screenshot kegagalan disimpan sebagai debug_backfill_login.png")
+                    
         except Exception as e:
             print(f"   ❌ Gagal navigasi saat renew token: {e}")
+            try:
+                page.screenshot(path="/opt/SMtracker/debug_backfill_error.png")
+                print("   📸 Screenshot error disimpan sebagai debug_backfill_error.png")
+            except:
+                pass
         finally:
             context.close()
             

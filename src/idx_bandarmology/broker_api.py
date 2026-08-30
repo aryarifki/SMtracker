@@ -397,9 +397,9 @@ def _broker_activity_rows(sym: str, md: dict[str, Any], fetched_at: str) -> list
 
 
 def _flow_row(sym: str, md: dict[str, Any], fallback_date: str, fetched_at: str) -> dict[str, Any] | None:
-    bs = md.get("broker_summary") or {}
-    if not (bs.get("brokers_buy") or bs.get("brokers_sell")):
-        return None
+    #bs = md.get("broker_summary") or {}
+    #if not (bs.get("brokers_buy") or bs.get("brokers_sell")):
+        #return None
     broker = _broker_section_from_marketdetector(sym, md)
     return {
         "date": broker.get("date") or fallback_date,

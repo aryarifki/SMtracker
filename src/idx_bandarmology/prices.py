@@ -109,15 +109,14 @@ def fetch_history_many(tickers: list[str], period: str = "1y", interval: str = "
     from sqlalchemy import text
     
     # ── INCREMENTAL SKIP LOGIC ──
-    print("[prices] Menganalisis database untuk melewati saham yang sudah ditarik harganya...")
+    print("[prices] Menganalisis database untuk melewati saham yang sudah ditarik harganya HARI INI...")
     try:
-        # Jika sebuah saham memiliki > 10 baris data harga, asumsikan sudah pernah ditarik.
+        # Pengecekan cerdas: Hanya skip jika data saham untuk TANGGAL HARI INI sudah tersimpan di DB
         q = text("""
-            SELECT ticker 
+            SELECT DISTINCT ticker 
             FROM prices 
-            WHERE ticker = ANY(:t)
-            GROUP BY ticker
-            HAVING COUNT(*) > 10
+            WHERE date = CURRENT_DATE 
+            AND ticker = ANY(:t)
         """)
         with storage.engine.connect() as conn:
             df_exist = pd.read_sql(q, conn, params={"t": tickers})

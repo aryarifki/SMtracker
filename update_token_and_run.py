@@ -7,6 +7,7 @@ import sys
 import os
 import time
 import shutil
+import argparse
 from datetime import datetime
 from pathlib import Path
 
@@ -20,7 +21,7 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from idx_bandarmology import pipeline
-from idx_bandarmology.broker_api import set_rate_limit
+from idx_bandarmology.broker_api import set_rate_limit, is_available
 try:
     from idx_bandarmology import config
 except ImportError:
@@ -115,20 +116,34 @@ def get_new_token(force_clean_session: bool = False) -> bool:
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Sinkronisasi harian otomatis SMtracker")
+    parser.add_argument("--force", action="store_true", help="Paksa tarik data ulang meskipun sudah ada di database hari ini")
+    args = parser.parse_args()
+
     print(f"\n{'='*60}")
     print(f"📅 Memulai Sinkronisasi Harian: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*60}")
     
     set_rate_limit(12.0)
     
+    # Logika resume: Jika user menggunakan --force, resume = False (artinya tarik paksa)
+    resume_mode = not args.force
+    if not resume_mode:
+        print("🚀 MODE PAKSA (--force) AKTIF: Menarik ulang semua data broker hari ini.")
+    
     max_retries = 3
     for attempt in range(max_retries):
         try:
+            # --- KAWAT JEBAKAN ---
+            if not is_available():
+                raise RuntimeError("Token is not configured")
+            # ---------------------
+                
             result = pipeline.run(
                 universe_mode="all",
                 price_period="1y",
                 fetch_broker_data=True,
-                resume=True
+                resume=resume_mode
             )
             print(f"\n🎉 Eksekusi harian selesai! Tersimpan: {result['n_broker']} baris broker.")
             break 
@@ -157,3 +172,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    

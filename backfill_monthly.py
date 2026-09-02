@@ -8,6 +8,7 @@ import json
 import sys
 import os
 import time
+import shutil
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -97,7 +98,15 @@ def estimate_time(n_tickers: int, n_days: int) -> str:
     return f"~{total_seconds / 3600:.1f} jam ({total_seconds/60:.0f} menit)"
 
 # ── SISTEM PEMULIHAN TOKEN OTOMATIS ─────────────────────────────────────────
-def auto_renew_token() -> bool:
+def auto_renew_token(force_clean_session: bool = False) -> bool:
+    if force_clean_session:
+        print("   🧹 Membersihkan sesi browser lama yang korup...")
+        if _SESSION_DIR.exists():
+            shutil.rmtree(_SESSION_DIR, ignore_errors=True)
+        os.system("sed -i '/BROKER_API_TOKEN/d' /opt/SMtracker/.env")
+        if "BROKER_API_TOKEN" in os.environ:
+            del os.environ["BROKER_API_TOKEN"]
+
     print("\n   ⚠️ PERINGATAN: Akses API ditolak atau koneksi terputus (Mungkin Token Kedaluwarsa)!")
     print("   🤖 Mengaktifkan peramban darurat untuk mencuri token baru di latar belakang...")
     
@@ -149,7 +158,6 @@ def auto_renew_token() -> bool:
                         break
                     page.wait_for_timeout(2000)
                 
-                # --- Fitur Tambahan: Screenshot Otomatis jika gagal ---
                 if not captured_token:
                     print("\n   ❌ Waktu habis. Autentikasi tidak diselesaikan atau gagal.")
                     page.screenshot(path="/opt/SMtracker/debug_backfill_login.png")
@@ -235,9 +243,10 @@ def run_backfill_month(
             
             # Cek apakah error disebabkan oleh koneksi terputus (timeout) atau token mati (401/403)
             is_token_issue = any(k in error_msg for k in ["401", "403", "unauthorized", "forbidden", "token", "timeout", "read", "connection"])
+            force_clean = any(k in error_msg for k in ["401", "403", "unauthorized", "forbidden"])
             
             if is_token_issue and attempt < max_retries - 1:
-                if auto_renew_token():
+                if auto_renew_token(force_clean_session=force_clean):
                     print("   🔁 Mencoba melanjutkan unduhan dengan token baru...")
                     time.sleep(2)
                     continue  # Ulangi loop attempt

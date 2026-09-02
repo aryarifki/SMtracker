@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sinkronisasi harian otomatis dengan arsitektur Self-Healing & Retry."""
+"""Sinkronisasi harian otomatis dengan arsitektur Self-Healing, Retry & Live Progress."""
 
 from __future__ import annotations
 
@@ -124,9 +124,9 @@ def main():
     print(f"📅 Memulai Sinkronisasi Harian: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*60}")
     
+    # Batas kecepatan dipertahankan di angka 12 request per menit (1 req / 5 detik)
     set_rate_limit(12.0)
     
-    # Logika resume: Jika user menggunakan --force, resume = False (artinya tarik paksa)
     resume_mode = not args.force
     if not resume_mode:
         print("🚀 MODE PAKSA (--force) AKTIF: Menarik ulang semua data broker hari ini.")
@@ -134,16 +134,15 @@ def main():
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            # --- KAWAT JEBAKAN ---
             if not is_available():
                 raise RuntimeError("Token is not configured")
-            # ---------------------
                 
             result = pipeline.run(
                 universe_mode="all",
                 price_period="1y",
                 fetch_broker_data=True,
-                resume=resume_mode
+                resume=resume_mode,
+                broker_batch_size=50  # <-- Penambahan parameter untuk memaksa terminal melapor secara aktif
             )
             print(f"\n🎉 Eksekusi harian selesai! Tersimpan: {result['n_broker']} baris broker.")
             break 
@@ -156,7 +155,6 @@ def main():
             
             if is_token_issue and attempt < max_retries - 1:
                 print("⚠️ Terdeteksi masalah Token/Jaringan.")
-                # Jika token ditolak, kita wajib menghancurkan sesi browser agar Playwright tidak mencuri token basi
                 force_clean = any(k in error_msg for k in ["401", "403", "unauthorized", "forbidden"])
                 
                 if get_new_token(force_clean_session=force_clean):
@@ -172,4 +170,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    

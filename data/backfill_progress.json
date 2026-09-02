@@ -1,10 +1,22 @@
 {
-  "completed": [
-    "2026-08",
-    "2026-07",
-    "2026-06"
-  ],
-  "failed": {},
   "started_at": "2026-08-16T17:20:48.765768",
-  "last_run": "2026-08-17T02:33:21.231776"
+  "last_run": "2026-09-02T17:21:23.477267",
+  "universes": {
+    "idx80": {
+      "completed": [
+        "2026-08",
+        "2026-07",
+        "2026-06"
+      ],
+      "failed": {}
+    },
+    "all": {
+      "completed": [
+        "2026-01"
+      ],
+      "failed": {
+        "2026-07": "401 Client Error: Unauthorized for url: https://exodus.stockbit.com/marketdetectors/ABBA?from=2026-07-01&to=2026-07-01"
+      }
+    }
+  }
 }

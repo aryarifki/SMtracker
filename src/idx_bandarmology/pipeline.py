@@ -61,21 +61,19 @@ def _broker_flow_rows(watchlist_results: dict) -> pd.DataFrame:
         })
     return pd.DataFrame(rows)
 
-
 def _already_fetched_today(tickers: list[str], table: str = "broker_flow") -> list[str]:
-    """Return tickers that already have a row in the last 3 days (handles weekend/holiday)."""
+    """Return tickers that already have a row for CURRENT_DATE."""
     if not tickers:
         return []
     from sqlalchemy import text
     q = f"""
         SELECT DISTINCT ticker FROM {table} 
-        WHERE date >= (CURRENT_DATE - INTERVAL '3 days') 
+        WHERE date = CURRENT_DATE 
         AND ticker = ANY(:tickers)
     """
     with storage.engine.connect() as conn:
         df = pd.read_sql(text(q), conn, params={"tickers": [t.upper() for t in tickers]})
     return df["ticker"].str.upper().tolist() if not df.empty else []
-
 
 def run(
     tickers: list[str] | None = None,

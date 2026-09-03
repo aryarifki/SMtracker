@@ -1,4 +1,5 @@
 """Pipeline orchestrator — scrape -> clean -> store, one call to run it all.
+
 Enhanced for large universes:
   * Rate-limited broker fetching (safe for 900 tickers).
   * Auto-Commit (Micro-batching) per 100 tickers to prevent data loss.
@@ -135,8 +136,8 @@ def run(
                     
                     valid_syms = [s for s in batch if s in batch_results and batch_results[s].get("available")]
                     if valid_syms:
-                        _, activity_df = broker_api.fetch_historical_broker_data(valid_syms, start, end)
-                        saved_act = storage.upsert_broker_activity(activity_df)
+                        # PERBAIKAN: Tangkap langsung angka kembaliannya, tidak perlu di-upsert ulang
+                        _hist_broker, saved_act = broker_api.fetch_historical_broker_data(valid_syms, start, end)
                         n_activity += saved_act
                         
                     print(f"[pipeline]   🔄 Batch saved to DB! Cumulative: {n_broker} broker rows, {n_activity} activity rows")
@@ -218,3 +219,4 @@ def backfill_broker_history(
         "tickers": syms, "mode": mode_label, "start_date": str(start_date), "end_date": str(end_date),
         "n_prices": n_prices, "n_broker": n_broker, "n_activity": n_activity, "elapsed_seconds": round(elapsed, 1),
      }
+ 

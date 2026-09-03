@@ -158,8 +158,13 @@ def _parse_date(value: str | date | datetime) -> date:
         return value.date()
     if isinstance(value, date):
         return value
-    return datetime.strptime(str(value), "%Y-%m-%d").date()
-
+    
+    # Gunakan Pandas agar kebal terhadap format tanggal aneh dari Stockbit
+    try:
+        return pd.to_datetime(str(value)).date()
+    except Exception:
+        # Jika gagal total, kembalikan tanggal hari ini secara default
+        return datetime.utcnow().date()
 
 # accdist label -> (signal code, score, readable English)
 _ACC_MAP: dict[str, tuple[str, int, str]] = {

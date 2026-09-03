@@ -142,7 +142,7 @@ def main():
                 price_period="1y",
                 fetch_broker_data=True,
                 resume=resume_mode,
-                broker_batch_size=50  # <-- Penambahan parameter untuk memaksa terminal melapor secara aktif
+                broker_batch_size=100  # <-- Penambahan parameter untuk memaksa terminal melapor secara aktif
             )
             print(f"\n🎉 Eksekusi harian selesai! Tersimpan: {result['n_broker']} baris broker.")
             break 

@@ -1,24 +1,38 @@
 """Pipeline orchestrator — scrape -> clean -> store, one call to run it all.
 
-Enhanced for large universes:
-  * Rate-limited broker fetching (safe for 900 tickers).
-  * Auto-Commit (Micro-batching) per 100 tickers to prevent data loss.
-  * Resume mode: skip tickers already stored for today.
+This is the only module you typically need to call directly:
+
+    from idx_bandarmology import pipeline
+    pipeline.run(["BBCA", "BBRI", "GOTO"])          # explicit list
+    pipeline.run(universe_mode="idx80")               # resolve via universe
+    pipeline.run()                                    # uses config.WATCHLIST
+
+Each run:
+  1. Pulls daily OHLCV from yfinance for every ticker (price history).
+  2. Pulls today's broker/bandar snapshot for every ticker
+     (skipped automatically if BROKER_API_TOKEN isn't set — prices still load).
+  3. Cleans/flattens both into tidy tables.
+  4. Upserts into SQLite / PostgreSQL via storage adapter.
+  5. Logs the run so you can see history in the dashboard.
 """
 
 from __future__ import annotations
 
-import time
 from datetime import date, datetime, timezone
-from typing import Any
 
 import pandas as pd
 
-from . import broker_api, config, prices, storage, universe
+from . import broker_api, config, prices, storage
 
 
 def _broker_flow_rows(watchlist_results: dict) -> pd.DataFrame:
-    """Flatten broker_api.fetch_watchlist() output into one tidy DataFrame."""
+    """Flatten broker_api.fetch_watchlist() output into one tidy DataFrame.
+
+    Uses *today* as the snapshot date — the broker/bandar endpoints
+    return the latest completed trading day's numbers, not a date range, so
+    each pipeline run captures one row per ticker per run-day. Running the
+    pipeline daily builds up a time series naturally.
+    """
     today = datetime.now(timezone.utc).date().isoformat()
     fetched_at = datetime.now(timezone.utc).isoformat()
     rows = []
@@ -46,124 +60,71 @@ def _broker_flow_rows(watchlist_results: dict) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _already_fetched_today(tickers: list[str], table: str = "broker_flow") -> list[str]:
-    """Return tickers that already have a row for CURRENT_DATE."""
-    if not tickers:
-        return []
-    from sqlalchemy import text
-    q = f"""
-        SELECT DISTINCT ticker FROM {table} 
-        WHERE date = CURRENT_DATE 
-        AND ticker = ANY(:tickers)
-    """
-    with storage.engine.connect() as conn:
-        df = pd.read_sql(text(q), conn, params={"tickers": [t.upper() for t in tickers]})
-    return df["ticker"].str.upper().tolist() if not df.empty else []
-
-
 def run(
     tickers: list[str] | None = None,
     universe_mode: str | None = None,
     price_period: str = "1y",
     fetch_broker_data: bool = True,
-    resume: bool = True,
-    broker_batch_size: int | None = 100,
-) -> dict[str, Any]:
-    """Run the full pipeline once. Returns a summary dict with timing."""
-    t0 = time.monotonic()
+) -> dict:
+    """Run the full pipeline once. Returns a small summary dict.
 
-    # ── SKIP WEEKEND ──
-    if date.today().weekday() >= 5:
-        print("[pipeline] Weekend detected — market closed, skipping broker fetch.")
-        return {
-            "tickers": [], "mode": "weekend", "n_prices": 0, "n_broker": 0,
-            "n_activity": 0, "elapsed_seconds": 0, "notes": "skipped: weekend",
-        }
+    Parameters
+    ----------
+    tickers : list of plain tickers (e.g. ["BBCA", "BBRI"]).
+    universe_mode : "idx80", "all", "watchlist", etc.
+    price_period : yfinance period string, e.g. "1y", "6mo", "5y", "max".
+    fetch_broker_data : set False to skip the broker API.
+    """
+    if tickers is None and universe_mode is not None:
+        from . import universe as universe_mod
+        tickers = universe_mod.get_universe(universe_mode)
+    elif tickers is None:
+        tickers = config.WATCHLIST
 
-    if tickers:
-        syms = [t.upper() for t in tickers if t]
-        mode_label = "custom"
-    elif universe_mode:
-        syms = universe.get_universe(universe_mode)
-        mode_label = universe_mode
-    else:
-        syms = [t.upper() for t in config.WATCHLIST]
-        mode_label = "watchlist"
-
+    syms = [t.upper() for t in tickers]
     storage.init_db()
-    print(f"[pipeline] universe mode={mode_label}, tickers={len(syms)}")
+
+    print(f"[pipeline] targets: {len(syms)} tickers")
 
     # 1) prices
-    t1 = time.monotonic()
-    print(f"[pipeline] fetching prices from IDX API for {len(syms)} tickers...")
-    n_prices = prices.fetch_history_many(syms, period=price_period)
-    t2 = time.monotonic()
-    print(f"[pipeline]   -> {n_prices} price rows upserted in {t2-t1:.1f}s")
+    print("[pipeline] fetching prices from yfinance...")
+    price_df = prices.fetch_history_many(syms, period=price_period)
+    n_prices = storage.upsert_prices(price_df)
+    print(f"[pipeline]   -> {n_prices} price rows upserted")
 
     # 2) broker / bandar flow
     n_broker = 0
     n_activity = 0
-    skipped: list[str] = []
-
+    broker_results: dict = {}
     if fetch_broker_data and broker_api.is_available():
-        target_syms = syms
-        if resume:
-            skipped = _already_fetched_today(syms)
-            if skipped:
-                print(f"[pipeline] resume: skipping {len(skipped)} tickers already fetched recently")
-                target_syms = [s for s in syms if s not in skipped]
-
-        if target_syms:
-            print(f"[pipeline] fetching broker/bandar data for {len(target_syms)} tickers...")
-            t3 = time.monotonic()
-
-            batch_size = broker_batch_size if broker_batch_size else 100
-            
-            for i in range(0, len(target_syms), batch_size):
-                batch = target_syms[i:i + batch_size]
-                print(f"\n[pipeline]   ▶ BATCH {i//batch_size + 1}/{(len(target_syms)-1)//batch_size + 1}: {len(batch)} tickers")
-                
-                batch_results = broker_api.fetch_watchlist(batch, progress_every=max(1, len(batch)//5))
-                
-                # ── MICRO-BATCHING DB COMMIT ──
-                batch_df = _broker_flow_rows(batch_results)
-                if not batch_df.empty:
-                    saved_broker = storage.upsert_broker_flow(batch_df)
-                    n_broker += saved_broker
-                    
-                    start = batch_df["date"].min()
-                    end = batch_df["date"].max()
-                    
-                    valid_syms = [s for s in batch if s in batch_results and batch_results[s].get("available")]
-                    if valid_syms:
-                        # PERBAIKAN: Tangkap langsung angka kembaliannya, tidak perlu di-upsert ulang
-                        _hist_broker, saved_act = broker_api.fetch_historical_broker_data(valid_syms, start, end)
-                        n_activity += saved_act
-                        
-                    print(f"[pipeline]   🔄 Batch saved to DB! Cumulative: {n_broker} broker rows, {n_activity} activity rows")
-
-                if i + batch_size < len(target_syms):
-                    pause = 10.0
-                    print(f"[pipeline]   pausing {pause:.0f}s between batches...\n")
-                    time.sleep(pause)
-
-            t4 = time.monotonic()
-            print(f"[pipeline]   -> Total {n_broker} broker_flow rows and {n_activity} activity rows upserted in {t4-t3:.1f}s")
-        else:
-            print("[pipeline] all tickers already fetched recently (resume=True).")
+        print("[pipeline] fetching broker/bandar data...")
+        broker_results = broker_api.fetch_watchlist(syms)
+        broker_df = _broker_flow_rows(broker_results)
+        n_broker = storage.upsert_broker_flow(broker_df)
+        print(f"[pipeline]   -> {n_broker} broker_flow rows upserted")
+        if not broker_df.empty:
+            start = broker_df["date"].min()
+            end = broker_df["date"].max()
+            print("[pipeline] fetching per-broker distribution rows...")
+            _, activity_df = broker_api.fetch_historical_broker_data(syms, start, end)
+            n_activity = storage.upsert_broker_activity(activity_df)
+            print(f"[pipeline]   -> {n_activity} broker_activity rows upserted")
     elif fetch_broker_data:
-        print("[pipeline]   BROKER_API_TOKEN not set — skipping broker/bandar data")
+        print("[pipeline]   BROKER_API_TOKEN not set — skipping broker/bandar data "
+              "(prices-only run). See .env.example.")
 
-    elapsed = time.monotonic() - t0
     notes = "ok" if (n_prices or n_broker) else "no data fetched"
-    storage.log_run(syms, n_prices, n_broker, notes=f"{notes}; mode={mode_label}; elapsed={elapsed:.0f}s; skipped={len(skipped)}")
+    
+    # Update to include n_activity in log_run as supported by the new storage.py
+    storage.log_run(syms, n_prices, n_broker, n_activity=n_activity, notes=notes)
 
-    result = {
-        "tickers": syms, "mode": mode_label, "n_prices": n_prices, "n_broker": n_broker,
-        "n_activity": n_activity, "elapsed_seconds": round(elapsed, 1),
-        "broker_skipped": len(skipped), "broker_fetched": len(syms) - len(skipped), "notes": notes,
+    return {
+        "tickers": syms,
+        "n_prices": n_prices,
+        "n_broker": n_broker,
+        "n_activity": n_activity,
+        "broker_results": broker_results,
     }
-    return result
 
 
 def backfill_broker_history(
@@ -173,50 +134,55 @@ def backfill_broker_history(
     end_date: str | date | datetime | None = None,
     price_period: str = "1y",
     refresh_prices: bool = True,
-) -> dict[str, Any]:
-    """Backfill historical broker/bandar rows for event-study analysis."""
-    t0 = time.monotonic()
+) -> dict:
+    """Backfill historical broker/bandar rows for event-study analysis.
 
+    Either `tickers` or `universe_mode` must be provided.
+    If `universe_mode` is set, it resolves via universe.get_universe().
+    """
     if not broker_api.is_available():
         raise RuntimeError("BROKER_API_TOKEN/STOCKBIT_TOKEN is not configured.")
     if start_date is None or end_date is None:
         raise ValueError("start_date and end_date are required.")
 
-    if tickers:
-        syms = [t.upper() for t in tickers if t]
-        mode_label = "custom"
-    elif universe_mode:
-        syms = universe.get_universe(universe_mode)
-        mode_label = universe_mode
-    else:
-        syms = [t.upper() for t in config.WATCHLIST]
-        mode_label = "watchlist"
+    # Resolve Universe Mode
+    if tickers is None and universe_mode is not None:
+        from . import universe as universe_mod
+        tickers = universe_mod.get_universe(universe_mode)
+    elif tickers is None:
+        tickers = config.WATCHLIST
 
+    syms = [t.upper() for t in tickers]
     storage.init_db()
-    print(f"[pipeline] backfill mode={mode_label}, tickers={len(syms)}, range={start_date} to {end_date}")
 
     n_prices = 0
     if refresh_prices:
-        t1 = time.monotonic()
-        print(f"[pipeline] refreshing prices from IDX API for {len(syms)} tickers...")
-        n_prices = prices.fetch_history_many(syms, period=price_period)
-        print(f"[pipeline]   -> {n_prices} price rows in {time.monotonic()-t1:.1f}s")
+        print("[pipeline] refreshing prices from yfinance...")
+        price_df = prices.fetch_history_many(syms, period=price_period)
+        n_prices = storage.upsert_prices(price_df)
 
-    t2 = time.monotonic()
-    print(f"[pipeline] backfilling broker/bandar history...")
+    print(f"[pipeline] backfilling broker/bandar history for {len(syms)} tickers from {start_date} to {end_date}...")
+    broker_df, activity_df = broker_api.fetch_historical_broker_data(syms, start_date, end_date)
+    n_broker = storage.upsert_broker_flow(broker_df)
+    n_activity = storage.upsert_broker_activity(activity_df)
     
-    n_broker, n_activity = broker_api.fetch_historical_broker_data(syms, start_date, end_date)
-    
-    t3 = time.monotonic()
-    print(f"[pipeline]   -> {n_broker} broker_flow rows, {n_activity} activity rows safely saved to DB in {t3-t2:.1f}s")
+    print(f"[pipeline]   -> {n_broker} historical broker_flow rows upserted")
+    print(f"[pipeline]   -> {n_activity} historical broker_activity rows upserted")
 
-    elapsed = time.monotonic() - t0
+    # Update to include n_activity
     storage.log_run(
-        syms, n_prices, n_broker,
-        notes=f"backfill {start_date} to {end_date}; mode={mode_label}; elapsed={elapsed:.0f}s; activity={n_activity}",
+        syms,
+        n_prices,
+        n_broker,
+        n_activity=n_activity,
+        notes=f"historical broker backfill {start_date} to {end_date}",
     )
+    
     return {
-        "tickers": syms, "mode": mode_label, "start_date": str(start_date), "end_date": str(end_date),
-        "n_prices": n_prices, "n_broker": n_broker, "n_activity": n_activity, "elapsed_seconds": round(elapsed, 1),
-     }
- 
+        "tickers": syms,
+        "start_date": str(start_date),
+        "end_date": str(end_date),
+        "n_prices": n_prices,
+        "n_broker": n_broker,
+        "n_activity": n_activity,
+    }

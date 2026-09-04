@@ -35,6 +35,8 @@ _PROGRESS_FILE = _ROOT / "data" / "backfill_progress.json"
 _PROGRESS_FILE.parent.mkdir(parents=True, exist_ok=True)
 _ENV_PATH = _ROOT / ".env"
 _SESSION_DIR = _ROOT / "browser_session"
+_DEBUG_DIR = _ROOT / "debug"
+_DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 
 _PAUSE_BETWEEN_MONTHS = 15
 
@@ -103,9 +105,15 @@ def auto_renew_token(force_clean_session: bool = False) -> bool:
         print("   🧹 Membersihkan sesi browser lama yang korup...")
         if _SESSION_DIR.exists():
             shutil.rmtree(_SESSION_DIR, ignore_errors=True)
-        os.system("sed -i '/BROKER_API_TOKEN/d' /opt/SMtracker/.env")
+        # Menghapus token dari .env (menggunakan sed sesuai versi orisinal, 
+        # namun direkomendasikan menggunakan set_key untuk path dinamis)
+        env_str = str(_ENV_PATH)
+        os.system(f"sed -i '/BROKER_API_TOKEN/d' {env_str}")
         if "BROKER_API_TOKEN" in os.environ:
             del os.environ["BROKER_API_TOKEN"]
+        # Hapus juga dari in-memory config agar sinkron
+        if config is not None:
+            config.set_broker_api_token("")
 
     print("\n   ⚠️ PERINGATAN: Akses API ditolak atau koneksi terputus (Mungkin Token Kedaluwarsa)!")
     print("   🤖 Mengaktifkan peramban darurat untuk mencuri token baru di latar belakang...")
@@ -160,14 +168,16 @@ def auto_renew_token(force_clean_session: bool = False) -> bool:
                 
                 if not captured_token:
                     print("\n   ❌ Waktu habis. Autentikasi tidak diselesaikan atau gagal.")
-                    page.screenshot(path="/opt/SMtracker/debug_backfill_login.png")
-                    print("   📸 Screenshot kegagalan disimpan sebagai debug_backfill_login.png")
+                    debug_path = _DEBUG_DIR / "debug_backfill_login.png"
+                    page.screenshot(path=str(debug_path))
+                    print(f"   📸 Screenshot kegagalan disimpan sebagai {debug_path.name}")
                     
         except Exception as e:
             print(f"   ❌ Gagal navigasi saat renew token: {e}")
             try:
-                page.screenshot(path="/opt/SMtracker/debug_backfill_error.png")
-                print("   📸 Screenshot error disimpan sebagai debug_backfill_error.png")
+                debug_path = _DEBUG_DIR / "debug_backfill_error.png"
+                page.screenshot(path=str(debug_path))
+                print(f"   📸 Screenshot error disimpan sebagai {debug_path.name}")
             except:
                 pass
         finally:
@@ -178,7 +188,7 @@ def auto_renew_token(force_clean_session: bool = False) -> bool:
         set_key(dotenv_path=_ENV_PATH, key_to_set="BROKER_API_TOKEN", value_to_set=captured_token)
         os.environ["BROKER_API_TOKEN"] = captured_token
         if config is not None:
-            config.BROKER_API_TOKEN = captured_token  # Hot-swap ke memori
+            config.set_broker_api_token(captured_token)  # Menggunakan setter dari config.py
         return True
     
     print("   ❌ Gagal mendapatkan token darurat.")
@@ -219,6 +229,7 @@ def run_backfill_month(
             t0 = time.monotonic()
             set_rate_limit(rate_limit)
 
+            # Memanggil pipeline dengan parameter universe_mode
             result = pipeline.backfill_broker_history(
                 universe_mode=universe_mode, 
                 start_date=start,
@@ -268,7 +279,10 @@ def main() -> None:
     parser.add_argument("--reset-progress", action="store_true")
 
     args = parser.parse_args()
+    
+    # Inisialisasi DB menggunakan arsitektur dual-engine yang baru
     storage.init_db()
+    
     progress = load_progress()
 
     if args.reset_progress:

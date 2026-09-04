@@ -442,7 +442,11 @@ def _parse_date(value: str | date | datetime) -> date:
         return value.date()
     if isinstance(value, date):
         return value
-    return datetime.strptime(str(value), "%Y-%m-%d").date()
+    import pandas as pd
+    try:
+        return pd.to_datetime(str(value)).date()
+    except Exception:
+        return datetime.utcnow().date()
 
 
 def fetch_historical_broker_flow(

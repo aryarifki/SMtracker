@@ -7,7 +7,6 @@ This module exposes:
   * Bandar detector accumulation/distribution states.
   * Foreign-vs-domestic transaction flow.
   * Multi-timeframe price performance used as a cross-check.
-  * Rate-limited fetching for large universes (~900 tickers).
 
 Every numeric field is normalized to a float or ``None`` — nothing is
 fabricated when a field is missing. Each section also carries a short
@@ -16,13 +15,10 @@ English summary string for quick display in the dashboard.
 
 from __future__ import annotations
 
-import concurrent.futures
-import threading
 import time
 from datetime import date, datetime, timedelta
 from typing import Any, Callable, Optional
 
-import pandas as pd
 import requests
 
 from . import config
@@ -32,45 +28,24 @@ _TIMEOUT = 15.0
 _CACHE_TTL = 300.0  # 5 minutes — upstream data is end-of-day and refreshes slowly.
 _cache: dict[str, tuple[float, Any]] = {}
 
-# ── rate limiter (token bucket) ────────────────────────────────────────────
-# Stockbit appears to allow ~40 requests per 5 minutes (~1 req / 7.5 s).
-# We default to conservative 1 req / 8 s for safety.
-_RL_LOCK = threading.Lock()
-_RL_TOKENS: float = 1.0
-_RL_LAST = time.monotonic()
-_RL_RATE: float = 1.0 / 8.0   # tokens per second (1 request per 8 s)
-_RL_BURST: float = 1.0        # max tokens
+# ── rate limiting state ──────────────────────────────────────────────────────
+_rate_limit_sec: float = 0.0
+_last_request_time: float = 0.0
 
+def set_rate_limit(seconds: float) -> None:
+    """Set maximum request rate in seconds (e.g., 8.0 for 1 request per 8s)."""
+    global _rate_limit_sec
+    _rate_limit_sec = max(0.0, seconds)
 
-def set_rate_limit(req_per_minute: float = 8.0) -> None:
-    """Adjust the rate limit dynamically.
-
-    Default 8 req/min = 1 req every 7.5 s.
-    If you discover the real limit is higher, call this before fetching.
-    """
-    global _RL_RATE
-    _RL_RATE = req_per_minute / 60.0
-    print(f"[broker_api] Rate limit set to {req_per_minute:.1f} req/min ({1/_RL_RATE:.1f}s interval)")
-
-
-def _acquire_token() -> None:
-    """Block until a token is available (token-bucket style)."""
-    global _RL_TOKENS, _RL_LAST
-    with _RL_LOCK:
-        now = time.monotonic()
-        elapsed = now - _RL_LAST
-        _RL_TOKENS = min(_RL_BURST, _RL_TOKENS + elapsed * _RL_RATE)
-        _RL_LAST = now
-        if _RL_TOKENS < 1.0:
-            need = 1.0 - _RL_TOKENS
-            sleep = need / _RL_RATE
-            _RL_LAST = now + sleep
-            _RL_TOKENS = 0.0
-        else:
-            sleep = 0.0
-            _RL_TOKENS -= 1.0
-    if sleep > 0:
-        time.sleep(sleep)
+def _throttle() -> None:
+    """Sleep if the time elapsed since the last request is less than the limit."""
+    global _last_request_time
+    if _rate_limit_sec <= 0:
+        return
+    elapsed = time.time() - _last_request_time
+    if elapsed < _rate_limit_sec:
+        time.sleep(_rate_limit_sec - elapsed)
+    _last_request_time = time.time()
 
 
 # ── transport ────────────────────────────────────────────────────────────────
@@ -87,7 +62,10 @@ def _get(path: str) -> Any:
             "BROKER_API_TOKEN not configured — add it to your .env "
             "(see .env.example)"
         )
-    _acquire_token()  # <-- rate limit applied here
+    
+    # Throttle before firing the actual request
+    _throttle()
+    
     resp = requests.get(
         _BASE + path,
         headers={
@@ -151,20 +129,6 @@ def _rp(v: Optional[float]) -> str:
 def _sym(ticker: str) -> str:
     return ticker.upper().replace(".JK", "").strip()
 
-
-def _parse_date(value: str | date | datetime) -> date:
-    """Parse various date inputs into a date object."""
-    if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, date):
-        return value
-    
-    # Gunakan Pandas agar kebal terhadap format tanggal aneh dari Stockbit
-    try:
-        return pd.to_datetime(str(value)).date()
-    except Exception:
-        # Jika gagal total, kembalikan tanggal hari ini secara default
-        return datetime.utcnow().date()
 
 # accdist label -> (signal code, score, readable English)
 _ACC_MAP: dict[str, tuple[str, int, str]] = {
@@ -402,9 +366,9 @@ def _broker_activity_rows(sym: str, md: dict[str, Any], fetched_at: str) -> list
 
 
 def _flow_row(sym: str, md: dict[str, Any], fallback_date: str, fetched_at: str) -> dict[str, Any] | None:
-    #bs = md.get("broker_summary") or {}
-    #if not (bs.get("brokers_buy") or bs.get("brokers_sell")):
-        #return None
+    bs = md.get("broker_summary") or {}
+    if not (bs.get("brokers_buy") or bs.get("brokers_sell")):
+        return None
     broker = _broker_section_from_marketdetector(sym, md)
     return {
         "date": broker.get("date") or fallback_date,
@@ -425,6 +389,7 @@ def _flow_row(sym: str, md: dict[str, Any], fallback_date: str, fetched_at: str)
 
 
 # ── section: foreign vs domestic flow ────────────────────────────────────────
+
 def _foreign_domestic_section(sym: str) -> dict[str, Any]:
     fd = _get(f"/findata-view/foreign-domestic/v1/chart-data/{sym}").get("data", {}) or {}
     val = fd.get("value", {}) or {}
@@ -472,14 +437,28 @@ def _foreign_domestic_section(sym: str) -> dict[str, Any]:
     return out
 
 
-# ── historical fetchers ──────────────────────────────────────────────────────
+def _parse_date(value: str | date | datetime) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return datetime.strptime(str(value), "%Y-%m-%d").date()
+
 
 def fetch_historical_broker_flow(
     tickers: list[str],
     start_date: str | date | datetime,
     end_date: str | date | datetime,
 ) -> pd.DataFrame:
-    """Backfill daily broker/bandar snapshots from Stockbit marketdetectors."""
+    """Backfill daily broker/bandar snapshots from Stockbit marketdetectors.
+
+    The live pipeline stores one latest snapshot per run. This function fills
+    older signal dates by querying ``/marketdetectors/{ticker}?from=d&to=d``
+    for each weekday in the requested range, then flattening the result to the
+    same columns used by the ``broker_flow`` table.
+    """
+    import pandas as pd
+
     start = _parse_date(start_date)
     end = _parse_date(end_date)
     if start > end:
@@ -499,18 +478,14 @@ def fetch_historical_broker_flow(
         sym, iso = task
         try:
             md = _md_range(sym, iso, iso)
-        except Exception as exc:
-            error_msg = str(exc).lower()
-            if any(k in error_msg for k in ["401", "403", "unauthorized", "forbidden", "timeout", "connection", "read"]):
-                raise exc
+        except Exception:
             return None
         return _flow_row(sym, md, iso, fetched_at)
 
     from concurrent.futures import ThreadPoolExecutor
 
     tasks = [(sym, iso) for iso in dates for sym in syms]
-    max_workers = 1 if len(syms) > 20 else min(8, max(1, len(tasks)))
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(tasks)))) as pool:
         rows = [row for row in pool.map(fetch_one, tasks) if row is not None]
 
     cols = [
@@ -526,16 +501,10 @@ def fetch_historical_broker_data(
     tickers: list[str],
     start_date: str | date | datetime,
     end_date: str | date | datetime,
-) -> tuple[int, int]:
-    """Backfill daily flow rows and per-broker distribution rows.
-
-    Rate-limited: safe for large universes (hundreds of tickers).
-    Includes Granular Incremental Skip to resume safely and 
-    Micro-batching DB Commits to save progress per 1000 tasks.
-    """
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Backfill daily flow rows and per-broker distribution rows."""
+    import pandas as pd
     from concurrent.futures import ThreadPoolExecutor
-    from . import storage
-    from sqlalchemy import text
 
     start = _parse_date(start_date)
     end = _parse_date(end_date)
@@ -551,68 +520,30 @@ def fetch_historical_broker_data(
             dates.append(current.isoformat())
         current += timedelta(days=1)
 
-    # ── GRANULAR INCREMENTAL SKIP LOGIC ──
-    print("[broker_api] Checking database for existing data to skip...")
-    q = text("""
-        SELECT ticker, date 
-        FROM broker_flow 
-        WHERE date >= :s AND date <= :e AND ticker = ANY(:t)
-    """)
-    try:
-        with storage.engine.connect() as conn:
-            df_exist = pd.read_sql(q, conn, params={"s": start.isoformat(), "e": end.isoformat(), "t": syms})
-        
-        done_set = set()
-        if not df_exist.empty:
-            df_exist['date_str'] = pd.to_datetime(df_exist['date']).dt.strftime('%Y-%m-%d')
-            done_set = set(zip(df_exist['ticker'], df_exist['date_str']))
-    except Exception as e:
-        print(f"[broker_api] Could not check DB for skip logic: {e}")
-        done_set = set()
-    # ── END SKIP LOGIC ──
-
     errors: list[str] = []
-    
-    # FILTER: Hanya buat task untuk (ticker, tanggal) yang BELUM ada di database
-    tasks = [(sym, iso) for iso in dates for sym in syms if (sym, iso) not in done_set]
-    
-    total_tasks = len(tasks)
-    skipped_tasks = (len(dates) * len(syms)) - total_tasks
-    
-    if skipped_tasks > 0:
-        print(f"[broker_api] ⏭️ Skipped {skipped_tasks} tasks (already safely in database).")
-        
-    if total_tasks == 0:
-        print("[broker_api] All tasks for this date range are already in the database. Moving on!")
-        return 0, 0
-
-    completed = 0
-    last_log = time.time()
 
     def fetch_one(task: tuple[str, str]) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
-        nonlocal completed, last_log
         sym, iso = task
         try:
             md = _md_range(sym, iso, iso)
         except Exception as exc:  # noqa: BLE001
-            error_msg = str(exc).lower()
-            if any(k in error_msg for k in ["401", "403", "unauthorized", "forbidden", "timeout", "connection", "read"]):
-                raise exc
             if len(errors) < 8:
                 errors.append(f"{sym} {iso}: {type(exc).__name__}: {str(exc)[:140]}")
             return None, []
         flow = _flow_row(sym, md, iso, fetched_at)
         activity = _broker_activity_rows(sym, md, fetched_at) if flow else []
-        completed += 1
-        if time.time() - last_log >= 30:
-            pct = completed / total_tasks * 100 if total_tasks else 0
-            print(f"[broker_api] Progress {completed}/{total_tasks} ({pct:.1f}%)")
-            last_log = time.time()
         return flow, activity
 
-    max_workers = 1 if len(syms) > 20 else min(4, max(1, len(tasks)))
-    print(f"[broker_api] Fetching remaining {total_tasks} tasks in BATCHES of 1000 (workers={max_workers})")
+    tasks = [(sym, iso) for iso in dates for sym in syms]
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(tasks)))) as pool:
+        results = list(pool.map(fetch_one, tasks))
 
+    flow_rows = [flow for flow, _activity in results if flow is not None]
+    activity_rows = [row for _flow, activity in results for row in activity]
+    if errors and not flow_rows:
+        print("[broker_api] historical broker fetch returned no rows. Sample errors:")
+        for err in errors:
+            print(f"[broker_api]   {err}")
     flow_cols = [
         "date", "ticker", "bandar_signal", "bandar_signal_score",
         "foreign_net_broker", "local_net_broker", "gov_net_broker",
@@ -625,39 +556,7 @@ def fetch_historical_broker_data(
         "buy_lot", "sell_lot", "frequency",
         "buy_avg_price", "sell_avg_price", "fetched_at",
     ]
-
-    total_flow_upserted = 0
-    total_activity_upserted = 0
-    BATCH_SIZE = 1000
-
-    # ── MICRO-BATCHING LOGIC ──
-    for i in range(0, total_tasks, BATCH_SIZE):
-        batch_tasks = tasks[i : i + BATCH_SIZE]
-        print(f"[broker_api] 🔄 Starting batch {i//BATCH_SIZE + 1}/{(total_tasks-1)//BATCH_SIZE + 1} ({len(batch_tasks)} tasks)...")
-        
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            results = list(pool.map(fetch_one, batch_tasks))
-            
-        flow_rows = [flow for flow, _activity in results if flow is not None]
-        activity_rows = [row for _flow, activity in results for row in activity]
-        
-        flow_df = pd.DataFrame(flow_rows, columns=flow_cols)
-        activity_df = pd.DataFrame(activity_rows, columns=activity_cols)
-        
-        # LANGSUNG SIMPAN KE DATABASE PER BATCH!
-        if not flow_df.empty:
-            total_flow_upserted += storage.upsert_broker_flow(flow_df)
-        if not activity_df.empty:
-            total_activity_upserted += storage.upsert_broker_activity(activity_df)
-            
-        print(f"[broker_api] ✅ Batch saved to DB! Cumulative flow rows saved: {total_flow_upserted}")
-
-    if errors and total_flow_upserted == 0:
-        print("[broker_api] historical broker fetch returned no rows. Sample errors:")
-        for err in errors:
-            print(f"[broker_api]   {err}")
-            
-    return total_flow_upserted, total_activity_upserted
+    return pd.DataFrame(flow_rows, columns=flow_cols), pd.DataFrame(activity_rows, columns=activity_cols)
 
 
 # ── section: price performance (quick cross-check; daily OHLC comes from yfinance) ──
@@ -754,27 +653,12 @@ def _overall_summary(sym: str, r: dict[str, Any]) -> str:
     return f"{sym}: " + "; ".join(bits) + "."
 
 
-def fetch_watchlist(symbols: list[str], progress_every: int = 10) -> dict[str, dict[str, Any]]:
-    """Run fetch_analysis for each symbol. Never raises.
-
-    Uses concurrent.futures to speed up fetching while respecting the rate limit.
-    """
+def fetch_watchlist(symbols: list[str]) -> dict[str, dict[str, Any]]:
+    """Run fetch_analysis for each symbol in the watchlist. Never raises."""
     out: dict[str, dict[str, Any]] = {}
-    total = len(symbols)
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        future_to_sym = {executor.submit(fetch_analysis, s): s for s in symbols}
-
-        completed = 0
-        for future in concurrent.futures.as_completed(future_to_sym):
-            s = future_to_sym[future]
-            try:
-                out[_sym(s)] = future.result()
-            except Exception as exc:  # noqa: BLE001
-                out[_sym(s)] = {"ticker": _sym(s), "available": False, "reason": str(exc)[:160]}
-
-            completed += 1
-            if completed % progress_every == 0 or completed == total:
-                print(f"[broker_api] watchlist progress {completed}/{total} ({completed/total*100:.1f}%)")
-
+    for s in symbols:
+        try:
+            out[_sym(s)] = fetch_analysis(s)
+        except Exception as exc:  # noqa: BLE001
+            out[_sym(s)] = {"ticker": _sym(s), "available": False, "reason": str(exc)[:160]}
     return out

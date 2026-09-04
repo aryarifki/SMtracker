@@ -7,6 +7,7 @@ from the IDX endpoints using session cookies to bypass blocks.
 from __future__ import annotations
 
 import random
+import sys
 import time
 import pandas as pd
 import requests
@@ -122,11 +123,18 @@ def fetch_history_many(tickers: list[str], period: str = "1y", interval: str = "
     total_upserted = 0
     BATCH_SIZE = 300
     
+    print(f"[prices] Memulai penarikan data harga untuk {total} saham tersisa...")
+    
     for i, t in enumerate(target_tickers):
         if consecutive_403 >= 3:
-            print("\n[prices] 🚨 SIRKUIT BREAKER AKTIF: IP Anda diblokir permanen oleh Firewall IDX (Status 403).")
+            print("\n[prices] 🚨 SIRKUIT BREAKER AKTIF: IP Anda diblokir oleh Firewall IDX (Status 403).")
             break
             
+        pct = ((i + 1) / total) * 100
+        # ── INDIKATOR PROGRES DINAMIS (LIVE) ──
+        sys.stdout.write(f"\r[prices] ⏳ Mengunduh: {i+1}/{total} ({pct:.1f}%) | Saham: {t:<6} | Antrean buffer: {len(frames)}")
+        sys.stdout.flush()
+
         df, status = fetch_history(t, period=period, interval=interval)
         if status == 403:
             consecutive_403 += 1
@@ -141,9 +149,17 @@ def fetch_history_many(tickers: list[str], period: str = "1y", interval: str = "
             batch_df = pd.concat(frames, ignore_index=True)
             saved = storage.upsert_prices(batch_df)
             total_upserted += saved
+            sys.stdout.write(f"\n[prices] 🔄 Batch saved! {len(frames)} saham disimpan ke DB. Kumulatif baris: {total_upserted}\n")
+            sys.stdout.flush()
             frames = []
             
         if not is_last_item and status != 403:
             time.sleep(random.uniform(0.3, 1.2))
-            
+            if (i + 1) % 50 == 0:
+                sys.stdout.write(f"\n[prices] ☕ Rehat sejenak 4 detik (menjaga kestabilan koneksi WAF)...\n")
+                sys.stdout.flush()
+                time.sleep(random.uniform(3.0, 5.0))
+                
+    sys.stdout.write(f"\n[prices] ✅ Penarikan harga selesai! Total {total_upserted} baris harga tersimpan.\n")
+    sys.stdout.flush()
     return total_upserted

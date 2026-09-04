@@ -102,6 +102,12 @@ class SQLiteAdapter:
     def init_db(self) -> None:
         with self.get_conn() as conn:
             conn.executescript(self._SCHEMA)
+            # Schema migrations
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA table_info(runs)")
+            columns = [info[1] for info in cursor.fetchall()]
+            if "n_activity" not in columns:
+                conn.execute("ALTER TABLE runs ADD COLUMN n_activity INTEGER DEFAULT 0")
             conn.commit()
 
     def upsert_prices(self, df: pd.DataFrame) -> int:
@@ -296,6 +302,8 @@ class PostgreSQLAdapter:
             n_activity  INTEGER,
             notes       TEXT
         );
+
+        ALTER TABLE runs ADD COLUMN IF NOT EXISTS n_activity INTEGER;
 
         CREATE INDEX IF NOT EXISTS idx_prices_ticker ON prices(ticker);
         CREATE INDEX IF NOT EXISTS idx_broker_flow_ticker ON broker_flow(ticker);

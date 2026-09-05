@@ -157,9 +157,9 @@ def backfill_broker_history(
         n_prices = prices.fetch_history_many(syms, period=price_period)
 
     print(f"[pipeline] backfilling broker/bandar history for {len(syms)} tickers from {start_date} to {end_date}...")
-    broker_df, activity_df = broker_api.fetch_historical_broker_data(syms, start_date, end_date)
-    n_broker = storage.upsert_broker_flow(broker_df)
-    n_activity = storage.upsert_broker_activity(activity_df)
+    
+    # PERBAIKAN: Hanya tangkap nilai angka kembalian, tidak di-upsert ulang karena sudah disimpan oleh modul broker_api
+    n_broker, n_activity = broker_api.fetch_historical_broker_data(syms, start_date, end_date)
     
     elapsed = time.monotonic() - t0
     storage.log_run(syms, n_prices, n_broker, n_activity=n_activity, notes=f"backfill {start_date} to {end_date}")

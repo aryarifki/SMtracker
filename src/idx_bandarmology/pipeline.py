@@ -113,7 +113,6 @@ def run(
                     valid_syms = [s for s in batch if s in batch_results and batch_results[s].get("available")]
                     
                     if valid_syms:
-                        # PERBAIKAN: Tangkap nilai integer, hindari penggunaan .empty
                         _hist_flow, _hist_act = broker_api.fetch_historical_broker_data(valid_syms, start, end)
                         n_activity += _hist_act
                             

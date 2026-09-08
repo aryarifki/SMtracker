@@ -1649,4 +1649,4 @@ with raw_tab:
     activity_view["Type"] = activity_view["Type"].map(participant_label)
     st.dataframe(style_table(activity_view, money_cols=["Buy", "Sell", "Net"]), use_container_width=True, hide_index=True)
 
-st.caption(f"Database: {storage.config.DB_PATH}")
+st.caption(f"Database: {storage.config.DATABASE_URL}")

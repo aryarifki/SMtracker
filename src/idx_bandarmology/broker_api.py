@@ -587,10 +587,21 @@ def fetch_historical_broker_data(
         sym, iso = task
         try:
             md = _md_range(sym, iso, iso)
-        except Exception as exc:  # noqa: BLE001
+        except requests.HTTPError as exc:
+            # ── TAMBAHKAN BLOK INI ──
+            # Jika token kedaluwarsa (401/403), langsung lempar error agar 
+            # sistem auto-renew token di backfill_monthly.py terpicu!
+            if exc.response is not None and exc.response.status_code in (401, 403):
+                raise RuntimeError(f"Token Expired ({exc.response.status_code})") from exc
+            
             if len(errors) < 8:
                 errors.append(f"{sym} {iso}: {type(exc).__name__}: {str(exc)[:140]}")
             return None, []
+        except Exception as exc:
+            if len(errors) < 8:
+                errors.append(f"{sym} {iso}: {type(exc).__name__}: {str(exc)[:140]}")
+            return None, []
+            
         flow = _flow_row(sym, md, iso, fetched_at)
         activity = _broker_activity_rows(sym, md, fetched_at) if flow else []
         completed += 1
@@ -599,7 +610,7 @@ def fetch_historical_broker_data(
             print(f"[broker_api] Progress {completed}/{total_tasks} ({pct:.1f}%)")
             last_log = time.time()
         return flow, activity
-
+        
     max_workers = 1 if len(syms) > 20 else min(4, max(1, len(tasks)))
     print(f"[broker_api] Fetching remaining {total_tasks} tasks in BATCHES of 1000 (workers={max_workers})")
 
@@ -625,8 +636,16 @@ def fetch_historical_broker_data(
         batch_tasks = tasks[i : i + BATCH_SIZE]
         print(f"[broker_api] 🔄 Starting batch {i//BATCH_SIZE + 1}/{(total_tasks-1)//BATCH_SIZE + 1} ({len(batch_tasks)} tasks)...")
         
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            results = list(pool.map(fetch_one, batch_tasks))
+        try:
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                results = list(pool.map(fetch_one, batch_tasks))
+        except RuntimeError as exc:
+            # ── TAMBAHKAN BLOK INI ──
+            # Tangkap error dari fetch_one, hentikan batch, dan lempar ke 
+            # backfill_monthly.py agar token diperbarui!
+            if "Token Expired" in str(exc):
+                print(f"[broker_api] 🛑 {exc}. Menghentikan proses untuk pembaruan token...")
+                raise  # Lempar error ini ke pipeline.py dan backfill_monthly.py
             
         flow_rows = [flow for flow, _activity in results if flow is not None]
         activity_rows = [row for _flow, activity in results for row in activity]
@@ -641,7 +660,7 @@ def fetch_historical_broker_data(
             total_activity_upserted += storage.upsert_broker_activity(activity_df)
             
         print(f"[broker_api] ✅ Batch saved to DB! Cumulative flow rows saved: {total_flow_upserted}")
-
+        
     if errors and total_flow_upserted == 0:
         print("[broker_api] historical broker fetch returned no rows. Sample errors:")
         for err in errors:

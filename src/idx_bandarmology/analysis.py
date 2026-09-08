@@ -726,7 +726,7 @@ def causality_foreign_vs_price(ticker: str, max_lags: int = 5) -> dict[str, obje
         
     data = df[["return", "foreign_net_broker"]].values
     try:
-        results = grangercausalitytests(data, maxlag=max_lags, verbose=False)
+        results = grangercausalitytests(data, maxlag=max_lags)
         p_values = {lag: results[lag][0]["ssr_ftest"][1] for lag in range(1, max_lags + 1)}
         min_p = min(p_values.values())
         best_lag = [lag for lag, p in p_values.items() if p == min_p][0]
@@ -773,7 +773,7 @@ def causality_by_participant(ticker: str, max_lags: int = 5) -> pd.DataFrame:
             
         data = df[["return", "net_value"]].values
         try:
-            res = grangercausalitytests(data, maxlag=max_lags, verbose=False)
+            res = grangercausalitytests(data, maxlag=max_lags)
             p_vals = {lag: res[lag][0]["ssr_ftest"][1] for lag in range(1, max_lags + 1)}
             min_p = min(p_vals.values())
             best_lag = [lag for lag, p in p_vals.items() if p == min_p][0]
@@ -826,7 +826,7 @@ def causality_by_broker(ticker: str, top_n: int = 20, max_lags: int = 5) -> pd.D
             
         data = df[["return", "net_value"]].values
         try:
-            res = grangercausalitytests(data, maxlag=max_lags, verbose=False)
+            res = grangercausalitytests(data, maxlag=max_lags)
             p_vals = {lag: res[lag][0]["ssr_ftest"][1] for lag in range(1, max_lags + 1)}
             min_p = min(p_vals.values())
             best_lag = [lag for lag, p in p_vals.items() if p == min_p][0]

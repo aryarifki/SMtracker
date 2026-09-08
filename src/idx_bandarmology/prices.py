@@ -89,11 +89,13 @@ def fetch_history_many(
     period: str = "1y",
     interval: str = "1d",
     max_workers: int = 6,
-) -> pd.DataFrame:
+) -> int:  # Ubah return type menjadi int
     """Fetch multiple tickers concurrently using ThreadPoolExecutor."""
+    from . import storage  # Tambahkan import storage
+    
     cols = ["date", "ticker", "open", "high", "low", "close", "volume"]
     if not tickers:
-        return pd.DataFrame(columns=cols)
+        return 0
     
     results: list[pd.DataFrame] = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -108,5 +110,10 @@ def fetch_history_many(
                 print(f"[prices] Error fetching {t}: {e}")
                 
     if not results:
-        return pd.DataFrame(columns=cols)
-    return pd.concat(results, ignore_index=True)
+        return 0
+        
+    final_df = pd.concat(results, ignore_index=True)
+    
+    # Simpan ke database dan kembalikan jumlah baris yang berhasil di-upsert
+    n_upserted = storage.upsert_prices(final_df)
+    return n_upserted

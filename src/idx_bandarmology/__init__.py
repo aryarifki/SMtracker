@@ -2,10 +2,10 @@
 
 Modules
 -------
-config        : .env loading, watchlist, paths, database config
+config        : .env loading, watchlist, paths, universe mode
 broker_api    : broker-flow client and bandar detector parser (rate-limited)
 prices        : yfinance client — OHLCV history for IDX tickers
-storage       : Dual-engine read/write adapters (SQLite for dev, PostgreSQL+SQLAlchemy for prod)
+storage       : PostgreSQL read/write helpers (SQLAlchemy edition)
 pipeline      : orchestrates scrape -> clean -> store, with batching & timing
 universe      : IDX listed companies manager (watchlist, idx30, lq45, idx80, all)
 features      : turns raw broker/price tables into a single tidy feature table

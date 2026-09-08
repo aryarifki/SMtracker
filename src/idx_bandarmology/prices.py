@@ -117,13 +117,12 @@ def fetch_history(ticker: str, period: str = "1y", interval: str = "1d") -> pd.D
             
     return pd.DataFrame(columns=cols)
 
-
 def fetch_history_many(
     tickers: list[str],
     period: str = "1y",
     interval: str = "1d",
     max_workers: int = 6,
-    batch_size: int = 50,  # <--- TAMBAHKAN INI
+    batch_size: int = 50,
 ) -> int:
     """Fetch multiple tickers concurrently, save to DB per batch, and return row count."""
     from . import storage
@@ -133,10 +132,16 @@ def fetch_history_many(
         return 0
         
     total_upserted = 0
+    total_batches = (len(tickers) + batch_size - 1) // batch_size
     
     # ── MICRO-BATCHING UNTUK HINDARI OOM ──
     for i in range(0, len(tickers), batch_size):
+        batch_num = i // batch_size + 1
         batch_tickers = tickers[i : i + batch_size]
+        
+        # CETAK LOG AGAR TIDAK TERLIHAT STUCK
+        print(f"[prices] 🔄 Mengambil batch harga {batch_num}/{total_batches} ({len(batch_tickers)} saham)...")
+        
         results: list[pd.DataFrame] = []
         
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -158,6 +163,9 @@ def fetch_history_many(
         # Simpan ke database per batch
         n_upserted = storage.upsert_prices(final_df)
         total_upserted += n_upserted
+        
+        # CETAK LOG SETELAH BATCH SELESAI DISIMPAN
+        print(f"[prices] ✅ Batch {batch_num} tersimpan! Total baris harga: {total_upserted}")
         
         # Kosongkan memori
         del results

@@ -113,9 +113,9 @@ def run(
                     valid_syms = [s for s in batch if s in batch_results and batch_results[s].get("available")]
                     
                     if valid_syms:
-                        _hist_broker, activity_df = broker_api.fetch_historical_broker_data(valid_syms, start, end)
-                        if not activity_df.empty:
-                            n_activity += storage.upsert_broker_activity(activity_df)
+                        # PERBAIKAN: Tangkap nilai integer, hindari penggunaan .empty
+                        _hist_flow, _hist_act = broker_api.fetch_historical_broker_data(valid_syms, start, end)
+                        n_activity += _hist_act
                             
                     print(f"[pipeline]   🔄 Batch saved to DB! Cumulative: {n_broker} broker rows, {n_activity} activity rows")
             print(f"[pipeline]   -> Total {n_broker} broker_flow rows and {n_activity} activity rows upserted in {time.monotonic()-t3:.1f}s")
@@ -158,7 +158,6 @@ def backfill_broker_history(
 
     print(f"[pipeline] backfilling broker/bandar history for {len(syms)} tickers from {start_date} to {end_date}...")
     
-    # PERBAIKAN: Hanya tangkap nilai angka kembalian, tidak di-upsert ulang karena sudah disimpan oleh modul broker_api
     n_broker, n_activity = broker_api.fetch_historical_broker_data(syms, start_date, end_date)
     
     elapsed = time.monotonic() - t0

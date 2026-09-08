@@ -1,4 +1,3 @@
-cat << 'EOF' > /opt/SMtracker/src/idx_bandarmology/prices.py
 """IDX API client — daily OHLCV history for IDX tickers."""
 
 from __future__ import annotations
@@ -140,4 +139,3 @@ def fetch_history_many(tickers: list[str], period: str = "1y", interval: str = "
     sys.stdout.write(f"\n[prices] ✅ Penarikan harga selesai! Total {total_upserted} baris harga tersimpan.\n")
     sys.stdout.flush()
     return total_upserted
-EOF

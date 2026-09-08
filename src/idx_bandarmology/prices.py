@@ -1,141 +1,112 @@
-"""IDX API client — daily OHLCV history for IDX tickers."""
+"""IDX API client — fast concurrent OHLCV history fetcher.
+
+This module fetches historical data directly from IDX endpoints using 
+connection pooling and thread-safe session reuse.
+"""
 
 from __future__ import annotations
 
-import random
-import sys
-import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+_SESSION_LOCK = threading.Lock()
+_SHARED_SESSION: requests.Session | None = None
+
 
 def _get_idx_session() -> requests.Session:
-    session = requests.Session()
-    session.headers.update({
-        'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'en-US,en;q=0.9,id;q=0.8',
-        'Referer': 'https://www.idx.co.id/',
-        'Upgrade-Insecure-Requests': '1',
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36'
-    })
-    try:
-        session.get("https://www.idx.co.id/id", timeout=15.0)
-        time.sleep(1.0)
-        session.headers.update({'X-Requested-With': 'XMLHttpRequest'})
-        session.get("https://www.idx.co.id/primary/home/GetIndexList", timeout=15.0)
-        time.sleep(1.0)
-    except Exception as e:
-        print(f"[prices] Gagal menginisialisasi sesi IDX: {e}")
-    return session
+    """Reuses a singleton Session with connection pooling and auto-retries."""
+    global _SHARED_SESSION
+    with _SESSION_LOCK:
+        if _SHARED_SESSION is not None:
+            return _SHARED_SESSION
 
-_SESSION = None
-
-def _ensure_session() -> requests.Session:
-    global _SESSION
-    if _SESSION is None: _SESSION = _get_idx_session()
-    return _SESSION
-
-def fetch_history(ticker: str, period: str = "1y", interval: str = "1d") -> tuple[pd.DataFrame, int]:
-    global _SESSION
-    cols = ["date", "ticker", "open", "high", "low", "close", "volume"]
-    sym = ticker.upper().strip()
-    session = _ensure_session()
-    url = f"https://www.idx.co.id/primary/StockData/GetStockHistory?symbol={sym}&from=&to="
-    
-    last_status = 200
-    max_retries = 5 
-    
-    for attempt in range(max_retries):
+        session = requests.Session()
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+        )
+        adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=retry_strategy)
+        session.mount("https://", adapter)
+        session.headers.update({
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'en-US,en;q=0.9,id;q=0.8',
+            'Referer': 'https://www.idx.co.id/',
+            'X-Requested-With': 'XMLHttpRequest',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+        })
         try:
-            resp = session.get(url, timeout=15.0)
-            last_status = resp.status_code
-            if not resp.ok: raise requests.exceptions.HTTPError(f"Server returned {last_status}")
-                
-            data = resp.json()
-            rows = []
-            for item in data.get("data", []) or []:
-                if not item.get("Date"): continue
-                rows.append({
-                    "date": pd.to_datetime(item.get("Date")).date(), "ticker": sym,
-                    "open": float(item.get("Open", 0) or 0), "high": float(item.get("High", 0) or 0),
-                    "low": float(item.get("Low", 0) or 0), "close": float(item.get("Close", 0) or 0), "volume": int(item.get("Volume", 0) or 0),
-                })
-                
-            if rows:
-                df = pd.DataFrame(rows)[cols]
-                return df.sort_values("date").reset_index(drop=True), 200
-            return pd.DataFrame(columns=cols), 200
-            
-        except Exception as exc:
-            last_status = 403 if "403" in str(exc) else (429 if "429" in str(exc) else 500)
-            if attempt >= max_retries - 1: break
-            time.sleep(min(1.0 * (2 ** attempt), 15.0))
-            if last_status in [403, 429]:
-                session = _get_idx_session()
-                _SESSION = session
-                
-    return pd.DataFrame(columns=cols), last_status
+            session.get("https://www.idx.co.id/id", timeout=10.0)
+            session.get("https://www.idx.co.id/primary/home/GetIndexList", timeout=10.0)
+        except Exception as e:
+            print(f"[prices] Session warmup notice: {e}")
+        
+        _SHARED_SESSION = session
+        return _SHARED_SESSION
 
-def fetch_history_many(tickers: list[str], period: str = "1y", interval: str = "1d") -> int:
-    from . import storage
-    from sqlalchemy import text
+
+def fetch_history(ticker: str, period: str = "1y", interval: str = "1d") -> pd.DataFrame:
+    """Daily OHLCV for one ticker fetched directly from IDX."""
+    cols = ["date", "ticker", "open", "high", "low", "close", "volume"]
+    sym = ticker.upper().strip().replace(".JK", "")
+    session = _get_idx_session()
+    url = f"https://www.idx.co.id/primary/ListedCompany/GetTradingInfoSS?code={sym}&start=0&length=1000"
     
-    print("[prices] Menganalisis database untuk melewati saham yang sudah ditarik harganya HARI INI...")
     try:
-        q = text("SELECT DISTINCT ticker FROM prices WHERE date = CURRENT_DATE AND ticker = ANY(:t)")
-        with storage.engine.connect() as conn:
-            df_exist = pd.read_sql(q, conn, params={"t": tickers})
-        done_set = set(df_exist['ticker'])
-    except Exception as e:
-        print(f"[prices] Gagal mengecek database: {e}")
-        done_set = set()
+        resp = session.get(url, timeout=12.0)
+        resp.raise_for_status()
+        data = resp.json()
         
-    target_tickers = [t for t in tickers if t not in done_set]
-    total = len(target_tickers)
-    skipped_count = len(tickers) - total
-    
-    if skipped_count > 0: print(f"[prices] ⏭️ Skipped {skipped_count} tickers (sudah ada di database).")
-    if total == 0:
-        print("[prices] Semua harga saham sudah lengkap di database.")
-        return 0
-        
-    frames = []
-    consecutive_403 = 0
-    total_upserted = 0
-    BATCH_SIZE = 50
-    
-    print(f"[prices] Memulai penarikan data harga untuk {total} saham tersisa...")
-    
-    for i, t in enumerate(target_tickers):
-        if consecutive_403 >= 3:
-            print("\n[prices] 🚨 SIRKUIT BREAKER AKTIF: IP Anda diblokir oleh Firewall IDX (Status 403).")
-            break
+        rows = []
+        for item in data.get("replies", []):
+            rows.append({
+                "date": pd.to_datetime(item.get("Date")).date(),
+                "ticker": sym,
+                "open": float(item.get("OpenPrice", 0)),
+                "high": float(item.get("High", 0)),
+                "low": float(item.get("Low", 0)),
+                "close": float(item.get("Close", 0)),
+                "volume": int(item.get("Volume", 0)),
+            })
             
-        pct = ((i + 1) / total) * 100
-        sys.stdout.write(f"\r[prices] ⏳ Mengunduh: {i+1}/{total} ({pct:.1f}%) | Saham: {t:<6} | Antrean buffer: {len(frames)}")
-        sys.stdout.flush()
+        if rows:
+            df = pd.DataFrame(rows)[cols]
+            return df.sort_values("date").reset_index(drop=True)
+            
+    except Exception as exc:
+        print(f"[prices] API IDX failed for {sym}: {type(exc).__name__}")
+        
+    return pd.DataFrame(columns=cols)
 
-        df, status = fetch_history(t, period=period, interval=interval)
-        if status == 403: consecutive_403 += 1
-        else: consecutive_403 = 0
-            
-        if not df.empty: frames.append(df)
-            
-        is_last_item = (i == total - 1)
-        if len(frames) > 0 and ((i + 1) % BATCH_SIZE == 0 or is_last_item):
-            batch_df = pd.concat(frames, ignore_index=True)
-            saved = storage.upsert_prices(batch_df)
-            total_upserted += saved
-            sys.stdout.write(f"\n[prices] 🔄 Batch saved! {len(frames)} saham disimpan ke DB. Kumulatif baris: {total_upserted}\n")
-            sys.stdout.flush()
-            frames = []
-            
-        if not is_last_item and status != 403:
-            time.sleep(random.uniform(0.3, 1.2))
-            if (i + 1) % 50 == 0:
-                sys.stdout.write(f"\n[prices] ☕ Rehat sejenak 4 detik (menjaga kestabilan koneksi WAF)...\n")
-                sys.stdout.flush()
-                time.sleep(random.uniform(3.0, 5.0))
+
+def fetch_history_many(
+    tickers: list[str],
+    period: str = "1y",
+    interval: str = "1d",
+    max_workers: int = 6,
+) -> pd.DataFrame:
+    """Fetch multiple tickers concurrently using ThreadPoolExecutor."""
+    cols = ["date", "ticker", "open", "high", "low", "close", "volume"]
+    if not tickers:
+        return pd.DataFrame(columns=cols)
+    
+    results: list[pd.DataFrame] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(fetch_history, t, period, interval): t for t in tickers}
+        for future in as_completed(futures):
+            try:
+                df = future.result()
+                if not df.empty:
+                    results.append(df)
+            except Exception as e:
+                t = futures[future]
+                print(f"[prices] Error fetching {t}: {e}")
                 
-    sys.stdout.write(f"\n[prices] ✅ Penarikan harga selesai! Total {total_upserted} baris harga tersimpan.\n")
-    sys.stdout.flush()
-    return total_upserted
+    if not results:
+        return pd.DataFrame(columns=cols)
+    return pd.concat(results, ignore_index=True)

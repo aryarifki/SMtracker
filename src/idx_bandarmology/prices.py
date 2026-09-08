@@ -123,31 +123,44 @@ def fetch_history_many(
     period: str = "1y",
     interval: str = "1d",
     max_workers: int = 6,
+    batch_size: int = 50,  # <--- TAMBAHKAN INI
 ) -> int:
-    """Fetch multiple tickers concurrently, save to DB, and return row count."""
+    """Fetch multiple tickers concurrently, save to DB per batch, and return row count."""
     from . import storage
     
     cols = ["date", "ticker", "open", "high", "low", "close", "volume"]
     if not tickers:
         return 0
-    
-    results: list[pd.DataFrame] = []
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(fetch_history, t, period, interval): t for t in tickers}
-        for future in as_completed(futures):
-            try:
-                df = future.result()
-                if not df.empty:
-                    results.append(df)
-            except Exception as e:
-                t = futures[future]
-                print(f"[prices] Error fetching {t}: {e}")
-                
-    if not results:
-        return 0
         
-    final_df = pd.concat(results, ignore_index=True)
+    total_upserted = 0
     
-    # Simpan ke database dan kembalikan jumlah baris yang berhasil di-upsert
-    n_upserted = storage.upsert_prices(final_df)
-    return n_upserted
+    # ── MICRO-BATCHING UNTUK HINDARI OOM ──
+    for i in range(0, len(tickers), batch_size):
+        batch_tickers = tickers[i : i + batch_size]
+        results: list[pd.DataFrame] = []
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(fetch_history, t, period, interval): t for t in batch_tickers}
+            for future in as_completed(futures):
+                try:
+                    df = future.result()
+                    if not df.empty:
+                        results.append(df)
+                except Exception as e:
+                    t = futures[future]
+                    print(f"[prices] Error fetching {t}: {e}")
+                    
+        if not results:
+            continue
+            
+        final_df = pd.concat(results, ignore_index=True)
+        
+        # Simpan ke database per batch
+        n_upserted = storage.upsert_prices(final_df)
+        total_upserted += n_upserted
+        
+        # Kosongkan memori
+        del results
+        del final_df
+        
+    return total_upserted

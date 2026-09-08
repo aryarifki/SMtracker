@@ -63,13 +63,13 @@ def _broker_flow_rows(watchlist_results: dict) -> pd.DataFrame:
 
 
 def _already_fetched_today(tickers: list[str], table: str = "broker_flow") -> list[str]:
-    """Return tickers that already have a row in the last 3 days (handles weekend/holiday)."""
+    """Return tickers that already have a row for TODAY."""
     if not tickers:
         return []
     from sqlalchemy import text
     q = f"""
         SELECT DISTINCT ticker FROM {table} 
-        WHERE date >= (CURRENT_DATE - INTERVAL '3 days') 
+        WHERE date = CURRENT_DATE 
         AND ticker = ANY(:tickers)
     """
     with storage.engine.connect() as conn:
@@ -100,7 +100,6 @@ def run(
             "elapsed_seconds": 0,
             "notes": "skipped: weekend (market closed)",
         }
-    # ── end skip weekend ──
 
     if tickers:
         syms = [t.upper() for t in tickers if t]
@@ -118,10 +117,7 @@ def run(
     # 1) prices
     t1 = time.monotonic()
     print(f"[pipeline] fetching prices from IDX API for {len(syms)} tickers...")
-    
-    # UPDATED: Penarikan harga sekarang menangani batch-commit sendiri dan mengembalikan angka
     n_prices = prices.fetch_history_many(syms, period=price_period)
-    
     t2 = time.monotonic()
     print(f"[pipeline]   -> {n_prices} price rows upserted in {t2-t1:.1f}s")
 
@@ -136,7 +132,7 @@ def run(
         if resume:
             skipped = _already_fetched_today(syms)
             if skipped:
-                print(f"[pipeline] resume: skipping {len(skipped)} tickers already fetched recently")
+                print(f"[pipeline] resume: skipping {len(skipped)} tickers already fetched today")
                 target_syms = [s for s in syms if s not in skipped]
 
         if target_syms:
@@ -169,11 +165,15 @@ def run(
                 end = broker_df["date"].max()
                 print("[pipeline] fetching per-broker distribution rows...")
                 t5 = time.monotonic()
-                _, activity_df = broker_api.fetch_historical_broker_data(
+                
+                # ── PERBAIKAN P0 #1 ──
+                # fetch_historical_broker_data sudah mengembalikan integer, jadi langsung di-unpack
+                _, n_activity = broker_api.fetch_historical_broker_data(
                     [s for s in target_syms if s in broker_results and broker_results[s].get("available")],
                     start, end,
                 )
-                n_activity = storage.upsert_broker_activity(activity_df)
+                # HAPUS: n_activity = storage.upsert_broker_activity(activity_df)
+                
                 t6 = time.monotonic()
                 print(f"[pipeline]   -> {n_activity} broker_activity rows upserted in {t6-t5:.1f}s")
         else:
@@ -198,7 +198,6 @@ def run(
     }
     print(f"[pipeline] run complete in {elapsed:.1f}s: {result['n_prices']} prices, {result['n_broker']} broker rows")
     return result
-
 
 def backfill_broker_history(
     tickers: list[str] | None = None,

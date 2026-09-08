@@ -107,6 +107,7 @@ def _fetch_bei_stock_summary(limit: int = 9999, retries: int = 3) -> list[dict[s
             rows = data.get("data", [])
             out = []
             
+             # Mapping JSON berdasarkan struktur getCompanyProfiles
             for row in rows:
                 code = row.get("KodeEmiten")
                 name = row.get("NamaEmiten")
@@ -114,8 +115,8 @@ def _fetch_bei_stock_summary(limit: int = 9999, retries: int = 3) -> list[dict[s
                     out.append({
                         "ticker": code.upper().strip(),
                         "name": (name or "").strip(),
-                        "board": "",
-                        "sector": "",
+                        "board": (row.get("PapanPencatatan") or "").strip(),   # <--- UBAH INI
+                        "sector": (row.get("Sektor") or "").strip(),           # <--- UBAH INI
                     })
             if out:
                 return out

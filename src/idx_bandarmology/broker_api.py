@@ -519,6 +519,7 @@ def fetch_historical_broker_data(
     tickers: list[str],
     start_date: str | date | datetime,
     end_date: str | date | datetime,
+    force: bool = False,  # <--- TAMBAHKAN INI
 ) -> tuple[int, int]:
     """Backfill daily flow rows and per-broker distribution rows.
 
@@ -545,24 +546,25 @@ def fetch_historical_broker_data(
         current += timedelta(days=1)
 
     # ── GRANULAR INCREMENTAL SKIP LOGIC ──
-    print("[broker_api] Checking database for existing data to skip...")
-    q = text("""
-        SELECT ticker, date 
-        FROM broker_flow 
-        WHERE date >= :s AND date <= :e AND ticker = ANY(:t)
-    """)
-    try:
-        with storage.engine.connect() as conn:
-            df_exist = pd.read_sql(q, conn, params={"s": start.isoformat(), "e": end.isoformat(), "t": syms})
-        
-        done_set = set()
-        if not df_exist.empty:
-            df_exist['date_str'] = pd.to_datetime(df_exist['date']).dt.strftime('%Y-%m-%d')
-            done_set = set(zip(df_exist['ticker'], df_exist['date_str']))
-    except Exception as e:
-        print(f"[broker_api] Could not check DB for skip logic: {e}")
-        done_set = set()
-    # ── END SKIP LOGIC ──
+    done_set = set()
+    if not force:  # <--- TAMBAHKAN KONDISI INI
+        print("[broker_api] Checking database for existing data to skip...")
+        q = text("""
+            SELECT ticker, date 
+            FROM broker_flow 
+            WHERE date >= :s AND date <= :e AND ticker = ANY(:t)
+        """)
+        try:
+            with storage.engine.connect() as conn:
+                df_exist = pd.read_sql(q, conn, params={"s": start.isoformat(), "e": end.isoformat(), "t": syms})
+            
+            if not df_exist.empty:
+                df_exist['date_str'] = pd.to_datetime(df_exist['date']).dt.strftime('%Y-%m-%d')
+                done_set = set(zip(df_exist['ticker'], df_exist['date_str']))
+        except Exception as e:
+            print(f"[broker_api] Could not check DB for skip logic: {e}")
+    else:
+        print("[broker_api] Force mode active. Ignoring existing DB records.")
 
     errors: list[str] = []
     

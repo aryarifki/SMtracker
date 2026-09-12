@@ -116,6 +116,8 @@ def auto_renew_token(force_clean_session: bool = False) -> bool:
 
 # --- LOGIKA EKSEKUSI HARIAN ---
 def run_daily_backfill(universe_mode: str, rate_limit: float, refresh_prices: bool, days_back: int) -> bool:
+    from idx_bandarmology import prices, broker_api # Impor langsung modulnya
+    
     end = date.today()
     start = end - timedelta(days=days_back)
 
@@ -132,17 +134,22 @@ def run_daily_backfill(universe_mode: str, rate_limit: float, refresh_prices: bo
             t0 = time.monotonic()
             set_rate_limit(rate_limit)
 
-            result = pipeline.backfill_broker_history(
-                universe_mode=universe_mode, 
-                start_date=start,
-                end_date=end,
-                refresh_prices=refresh_prices,
-                price_period="1y",
+            # 1. Ambil data harga (IDX) jika diizinkan
+            n_prices = 0
+            if refresh_prices:
+                print("[daily] Menarik data harga dari IDX...")
+                n_prices = prices.fetch_history_many(syms, period="1y")
+                print(f"[daily]   -> {n_prices} baris harga tersimpan.")
+
+            # 2. Ambil data broker langsung ke endpoint history (Bypass watchlist)
+            print("[daily] Menarik data broker dari Stockbit...")
+            n_broker, n_activity = broker_api.fetch_historical_broker_data(
+                syms, start, end, force=True # Force=True agar selalu eksekusi
             )
 
             elapsed = time.monotonic() - t0
             print(f"   ✅ Selesai dalam {elapsed/60:.1f} menit")
-            print(f"      📊 Broker rows: {result['n_broker']:,} | Activity rows: {result.get('n_activity', 0):,}")
+            print(f"      📊 Broker rows: {n_broker:,} | Activity rows: {n_activity:,}")
             return True
 
         except Exception as exc:
@@ -162,19 +169,3 @@ def run_daily_backfill(universe_mode: str, rate_limit: float, refresh_prices: bo
             else:
                 return False
     return False
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Backfill broker data harian")
-    parser.add_argument("--universe", default="watchlist", help="Universe yang akan ditarik")
-    parser.add_argument("--days", type=int, default=3, help="Jumlah hari ke belakang")
-    parser.add_argument("--rate-limit", type=float, default=8.0)
-    parser.add_argument("--no-refresh-prices", action="store_true")
-    args = parser.parse_args()
-    
-    storage.init_db()
-    
-    run_daily_backfill(args.universe, args.rate_limit, not args.no_refresh_prices, args.days)
-
-if __name__ == "__main__":
-    main()
-

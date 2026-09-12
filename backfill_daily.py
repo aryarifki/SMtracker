@@ -18,7 +18,7 @@ _SRC = _ROOT / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from idx_bandarmology import pipeline, storage, universe as universe_mod
+from idx_bandarmology import prices, storage, universe as universe_mod, broker_api
 from idx_bandarmology.broker_api import set_rate_limit
 try:
     from idx_bandarmology import config
@@ -116,8 +116,6 @@ def auto_renew_token(force_clean_session: bool = False) -> bool:
 
 # --- LOGIKA EKSEKUSI HARIAN ---
 def run_daily_backfill(universe_mode: str, rate_limit: float, refresh_prices: bool, days_back: int) -> bool:
-    from idx_bandarmology import prices, broker_api # Impor langsung modulnya
-    
     end = date.today()
     start = end - timedelta(days=days_back)
 
@@ -169,3 +167,26 @@ def run_daily_backfill(universe_mode: str, rate_limit: float, refresh_prices: bo
             else:
                 return False
     return False
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Backfill broker data harian")
+    parser.add_argument("--universe", default="watchlist", help="Universe yang akan ditarik")
+    parser.add_argument("--days", type=int, default=3, help="Jumlah hari ke belakang")
+    parser.add_argument("--rate-limit", type=float, default=8.0)
+    parser.add_argument("--no-refresh-prices", action="store_true")
+    args = parser.parse_args()
+    
+    # ── SKIP WEEKEND UNTUK CRONJOB ──
+    if date.today().weekday() >= 5:
+        print("🗓️ Hari ini akhir pekan (Sabtu/Minggu). Bursa saham tutup. Skrip dihentikan.")
+        sys.exit(0)
+        
+    storage.init_db()
+    
+    if not run_daily_backfill(args.universe, args.rate_limit, not args.no_refresh_prices, args.days):
+        print("\n🛑 CRONJOB GAGAL: Backfill harian tidak berhasil setelah 3x percobaan.")
+        sys.exit(1)
+
+# ── BLOK EKSEKUSI UTAMA ──
+if __name__ == "__main__":
+    main()

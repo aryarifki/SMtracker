@@ -12,33 +12,38 @@ def compute_hmm_regime(net_flows: list, n_states: int = 3) -> dict:
         
     X = np.array(net_flows).reshape(-1, 1)
     
-    # Model HMM Gaussian
-    model = hmm.GaussianHMM(n_components=n_states, covariance_type="full", n_iter=100, random_state=42)
-    model.fit(X)
-    
-    raw_states = model.predict(X)
-    raw_probs = model.predict_proba(X)
-    
-    # Mapping state deterministik berdasarkan mean foreign_net
-    # Indeks 0 = Distribusi (Terendah), 1 = Netral, 2 = Akumulasi (Tertinggi)
-    means = model.means_.flatten()
-    sorted_indices = np.argsort(means) # Urutan dari terkecil ke terbesar
-    
-    mapping = {
-        int(sorted_indices[0]): 0, # Lowest mean -> 0 (Distribution)
-        int(sorted_indices[1]): 1, # Middle mean -> 1 (Neutral)
-        int(sorted_indices[2]): 2  # Highest mean -> 2 (Accumulation)
-    }
-    
-    mapped_states = [mapping[int(s)] for s in raw_states]
-    # Reorder kolom probabilities agar konsisten dengan mapped_states [0, 1, 2]
-    mapped_probs = raw_probs[:, sorted_indices]
-    
-    return {
-        "states": mapped_states,
-        "probabilities": mapped_probs.tolist()
-    }
-
+    try:
+        # Model HMM Gaussian
+        model = hmm.GaussianHMM(n_components=n_states, covariance_type="full", n_iter=100, random_state=42)
+        model.fit(X)
+        
+        raw_states = model.predict(X)
+        raw_probs = model.predict_proba(X)
+        
+        # Mapping state deterministik berdasarkan mean foreign_net
+        means = model.means_.flatten()
+        sorted_indices = np.argsort(means)
+        
+        mapping = {
+            int(sorted_indices[0]): 0,
+            int(sorted_indices[1]): 1,
+            int(sorted_indices[2]): 2
+        }
+        
+        mapped_states = [mapping[int(s)] for s in raw_states]
+        mapped_probs = raw_probs[:, sorted_indices]
+        
+        return {
+            "states": mapped_states,
+            "probabilities": mapped_probs.tolist()
+        }
+    except Exception:
+        # Fallback jika matriks kovarians tidak valid (data terlalu datar/konstan)
+        # Kembalikan state netral (1) agar UI tidak crash
+        neutral_states = [1] * len(net_flows)
+        neutral_probs = [[0.0, 1.0, 0.0]] * len(net_flows)
+        return {"states": neutral_states, "probabilities": neutral_probs}
+        
 def compute_var_irf(foreign_net: list, returns: list, lags: int = 2, horizon: int = 5) -> dict:
     """Menghitung Impulse Response dari intervensi asing ke harga saham (VAR)."""
     if len(foreign_net) != len(returns) or len(foreign_net) < 20:

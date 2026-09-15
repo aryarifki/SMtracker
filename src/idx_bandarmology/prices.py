@@ -1,8 +1,4 @@
-"""IDX API client — fast concurrent OHLCV history fetcher with WAF bypass.
-
-This module fetches historical data directly from IDX endpoints using 
-connection pooling, session warming (anti-WAF), and thread-safe session reuse.
-"""
+"""IDX API client — fast concurrent OHLCV history fetcher with WAF bypass & robust error handling."""
 
 from __future__ import annotations
 
@@ -36,7 +32,6 @@ def _get_idx_session() -> requests.Session:
         adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=retry_strategy)
         session.mount("https://", adapter)
         
-        # Base headers sesuai referensi idx_api_wrapper.py
         session.headers.update({
             'Accept': 'application/json, text/plain, */*',
             'Accept-Language': 'en-US,en;q=0.9,id;q=0.8',
@@ -47,19 +42,11 @@ def _get_idx_session() -> requests.Session:
         
         # ── SESSION WARMING (Bypass WAF) ──
         try:
-            # 1. Akses halaman utama untuk mendapatkan cookie WAF
             session.get("https://www.idx.co.id/id", timeout=15.0)
             time.sleep(1)
-            
-            # 2. Tambahkan header X-Requested-With setelah dapat cookie
-            session.headers.update({
-                'X-Requested-With': 'XMLHttpRequest'
-            })
-            
-            # 3. Akses endpoint GetIndexList untuk "menyehatkan" sesi
+            session.headers.update({'X-Requested-With': 'XMLHttpRequest'})
             session.get("https://www.idx.co.id/primary/home/GetIndexList", timeout=15.0)
             time.sleep(1)
-            
             _SESSION_READY = True
         except Exception as e:
             print(f"[prices] Session warmup notice: {e}")
@@ -80,6 +67,8 @@ def fetch_history(ticker: str, period: str = "1y", interval: str = "1d") -> pd.D
     for attempt in range(max_retries):
         try:
             resp = session.get(url, timeout=15.0)
+            
+            # ── Tambahan: Cek status code secara eksplisit ──
             if resp.status_code != 200:
                 print(f"[prices] HTTP {resp.status_code} on {sym} (attempt {attempt+1})")
                 if attempt == max_retries - 1:
@@ -87,8 +76,13 @@ def fetch_history(ticker: str, period: str = "1y", interval: str = "1d") -> pd.D
                 time.sleep(min(1000 * (2 ** attempt) / 1000, 15))
                 continue
                 
-            resp.raise_for_status()
-            data = resp.json()
+            # ── Tambahan: Cek apakah response benar-benar JSON ──
+            try:
+                data = resp.json()
+            except ValueError:
+                # Server mengembalikan HTML (misal saat maintenance), bukan JSON
+                print(f"[prices] Response bukan JSON untuk {sym} (kemungkinan server maintenance).")
+                return pd.DataFrame(columns=cols)
             
             rows = []
             for item in data.get("replies", []):
@@ -112,16 +106,16 @@ def fetch_history(ticker: str, period: str = "1y", interval: str = "1d") -> pd.D
             print(f"[prices] API IDX failed for {sym} (attempt {attempt+1}): {type(exc).__name__}: {exc}")
             if attempt >= max_retries - 1:
                 return pd.DataFrame(columns=cols)
-            # Exponential backoff
             time.sleep(min(1000 * (2 ** attempt) / 1000, 15))
             
     return pd.DataFrame(columns=cols)
+
 
 def fetch_history_many(
     tickers: list[str],
     period: str = "1y",
     interval: str = "1d",
-    max_workers: int = 6,
+    max_workers: int = 3,       # <--- Diturunkan jadi 3 agar tidak kena ban DDoS
     batch_size: int = 50,
 ) -> int:
     """Fetch multiple tickers concurrently, save to DB per batch, and return row count."""
@@ -139,7 +133,6 @@ def fetch_history_many(
         batch_num = i // batch_size + 1
         batch_tickers = tickers[i : i + batch_size]
         
-        # CETAK LOG AGAR TIDAK TERLIHAT STUCK
         print(f"[prices] 🔄 Mengambil batch harga {batch_num}/{total_batches} ({len(batch_tickers)} saham)...")
         
         results: list[pd.DataFrame] = []
@@ -164,7 +157,6 @@ def fetch_history_many(
         n_upserted = storage.upsert_prices(final_df)
         total_upserted += n_upserted
         
-        # CETAK LOG SETELAH BATCH SELESAI DISIMPAN
         print(f"[prices] ✅ Batch {batch_num} tersimpan! Total baris harga: {total_upserted}")
         
         # Kosongkan memori

@@ -10,7 +10,7 @@ Supports multiple universe modes:
   * "custom"      -> User-defined comma-separated list
 
 The master ticker list is fetched once from BEI and cached in PostgreSQL.
-If BEI is blocked (403), falls back to a local CSV file or hard-coded lists.
+Using curl_cffi (browser impersonation) to bypass WAF 403 Forbidden.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-import requests
+from curl_cffi import requests as cffi_requests  # Menggunakan curl_cffi anti-WAF
 
 from . import config, storage
 
@@ -75,39 +75,26 @@ _EXTENDED_LIQUID = sorted(set(_IDX80 + _LQ45 + _IDX30 + config.WATCHLIST + [
 
 def _fetch_bei_stock_summary(limit: int = 9999, retries: int = 3) -> list[dict[str, Any]]:
     """
-    Fetch daftar saham aktif dari BEI menggunakan metode session warming anti-WAF.
-    Diadaptasi dari idx_api_wrapper.py.
+    Fetch daftar saham aktif dari BEI menggunakan curl_cffi (Anti 403 Forbidden).
+    Diadaptasi dari arsitektur idx-bei.
     """
-    session = requests.Session()
-    session.headers.update({
-        'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'en-US,en;q=0.9,id;q=0.8',
-        'Referer': 'https://www.idx.co.id/',
-        'Upgrade-Insecure-Requests': '1',
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36'
-    })
+    url = f"https://www.idx.co.id/primary/ListedCompany/GetCompanyProfiles?start=0&length={limit}"
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9,id;q=0.8",
+        "Referer": "https://www.idx.co.id/",
+    }
 
     for attempt in range(retries):
         try:
-            # 1. Session Warming: Akses halaman utama untuk mendapatkan cookie WAF
-            session.get("https://www.idx.co.id/id", timeout=15.0)
-            time.sleep(1)
-            
-            # 2. Tambahkan header X-Requested-With setelah cookie didapat
-            session.headers.update({'X-Requested-With': 'XMLHttpRequest'})
-            session.get("https://www.idx.co.id/primary/home/GetIndexList", timeout=15.0)
-            time.sleep(1)
-            
-            # 3. Tarik daftar emiten
-            url = f"https://www.idx.co.id/primary/ListedCompany/GetCompanyProfiles?start=0&length={limit}"
-            resp = session.get(url, timeout=30.0)
+            # Kunci sukses: impersonate="chrome" agar WAF IDX mengira ini browser asli
+            resp = cffi_requests.get(url, headers=headers, impersonate="chrome", timeout=30)
             resp.raise_for_status()
             data = resp.json()
             
             rows = data.get("data", [])
             out = []
             
-             # Mapping JSON berdasarkan struktur getCompanyProfiles
             for row in rows:
                 code = row.get("KodeEmiten")
                 name = row.get("NamaEmiten")
@@ -115,8 +102,8 @@ def _fetch_bei_stock_summary(limit: int = 9999, retries: int = 3) -> list[dict[s
                     out.append({
                         "ticker": code.upper().strip(),
                         "name": (name or "").strip(),
-                        "board": (row.get("PapanPencatatan") or "").strip(),   # <--- UBAH INI
-                        "sector": (row.get("Sektor") or "").strip(),           # <--- UBAH INI
+                        "board": (row.get("PapanPencatatan") or "").strip(),
+                        "sector": (row.get("Sektor") or "").strip(),
                     })
             if out:
                 return out
@@ -130,29 +117,29 @@ def _fetch_bei_stock_summary(limit: int = 9999, retries: int = 3) -> list[dict[s
 
 
 def _fetch_bei_constituent(index_code: str = "IHSG", retries: int = 3) -> list[str]:
-    """Fetch index constituents from BEI."""
+    """Fetch index constituents from BEI using curl_cffi."""
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "application/json",
         "Referer": "https://www.idx.co.id/id/data-pasar/indeks-saham/",
     }
-    with requests.Session() as session:
-        for attempt in range(retries):
-            try:
-                resp = session.get(
-                    _BEI_CONSTITUENT,
-                    params={"index": index_code},
-                    headers=headers,
-                    timeout=30,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                items = data.get("Items", []) or data.get("items", []) or data.get("data", []) or []
-                return [str(i.get("code") or i.get("StockCode") or i.get("ticker", "")).upper().strip() for i in items if i.get("code") or i.get("StockCode") or i.get("ticker")]
-            except Exception as exc:
-                print(f"[universe] BEI constituent fetch attempt {attempt + 1}/{retries} failed for {index_code}: {exc}")
-                if attempt < retries - 1:
-                    time.sleep(2 ** attempt)
+    
+    for attempt in range(retries):
+        try:
+            resp = cffi_requests.get(
+                _BEI_CONSTITUENT,
+                params={"index": index_code},
+                headers=headers,
+                impersonate="chrome",
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            items = data.get("Items", []) or data.get("items", []) or data.get("data", []) or []
+            return [str(i.get("code") or i.get("StockCode") or i.get("ticker", "")).upper().strip() for i in items if i.get("code") or i.get("StockCode") or i.get("ticker")]
+        except Exception as exc:
+            print(f"[universe] BEI constituent fetch attempt {attempt + 1}/{retries} failed for {index_code}: {exc}")
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
     return []
 
 

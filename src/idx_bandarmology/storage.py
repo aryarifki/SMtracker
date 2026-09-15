@@ -1,4 +1,4 @@
-"""PostgreSQL storage — SQLAlchemy edition (Optimized & Indexed).
+"""PostgreSQL storage — SQLAlchemy edition (Optimized, Indexed & IDX Integrated).
 
 Replaces raw psycopg2 connections with SQLAlchemy engine for full pandas
 compatibility while keeping bulk-upsert performance via raw psycopg2 
@@ -38,6 +38,14 @@ CREATE TABLE IF NOT EXISTS prices (
     volume  BIGINT,
     PRIMARY KEY (date, ticker)
 );
+
+-- Alter existing prices table for IDX OHLCV + Foreign Flow + Pasar Nego
+ALTER TABLE prices ADD COLUMN IF NOT EXISTS foreign_buy BIGINT;
+ALTER TABLE prices ADD COLUMN IF NOT EXISTS foreign_sell BIGINT;
+ALTER TABLE prices ADD COLUMN IF NOT EXISTS value BIGINT;
+ALTER TABLE prices ADD COLUMN IF NOT EXISTS frequency INTEGER;
+ALTER TABLE prices ADD COLUMN IF NOT EXISTS non_regular_volume BIGINT;
+ALTER TABLE prices ADD COLUMN IF NOT EXISTS non_regular_value BIGINT;
 
 CREATE TABLE IF NOT EXISTS broker_flow (
     date                DATE NOT NULL,
@@ -91,6 +99,49 @@ CREATE TABLE IF NOT EXISTS tickers (
     updated_at  TIMESTAMP
 );
 
+-- ── IDX Direct API Tables ──
+CREATE TABLE IF NOT EXISTS idx_broker_summary (
+    date DATE NOT NULL,
+    id_firm VARCHAR(20) NOT NULL,
+    firm_name VARCHAR(200),
+    volume BIGINT,
+    value BIGINT,
+    frequency INTEGER,
+    PRIMARY KEY (date, id_firm)
+);
+
+CREATE TABLE IF NOT EXISTS idx_index_summary (
+    date DATE NOT NULL,
+    index_code VARCHAR(20) NOT NULL,
+    index_name VARCHAR(100),
+    close NUMERIC,
+    volume BIGINT,
+    value BIGINT,
+    market_cap NUMERIC,
+    PRIMARY KEY (date, index_code)
+);
+
+CREATE TABLE IF NOT EXISTS financial_ratios (
+    code VARCHAR(20) NOT NULL,
+    year INT NOT NULL,
+    quarter INT NOT NULL,
+    per NUMERIC,
+    pbv NUMERIC,
+    roe NUMERIC,
+    roa NUMERIC,
+    der NUMERIC,
+    eps NUMERIC,
+    PRIMARY KEY (code, year, quarter)
+);
+
+CREATE TABLE IF NOT EXISTS corporate_actions (
+    date DATE NOT NULL,
+    ticker VARCHAR(20) NOT NULL,
+    ca_type VARCHAR(50) NOT NULL,
+    description TEXT,
+    PRIMARY KEY (date, ticker, ca_type)
+);
+
 -- Indeks komposit dan indeks tanggal tunggal untuk akselerasi query
 CREATE INDEX IF NOT EXISTS idx_prices_ticker_date ON prices(ticker, date);
 CREATE INDEX IF NOT EXISTS idx_prices_date ON prices(date);
@@ -101,6 +152,8 @@ CREATE INDEX IF NOT EXISTS idx_broker_activity_date ON broker_activity(date);
 CREATE INDEX IF NOT EXISTS idx_broker_activity_broker ON broker_activity(broker_code);
 CREATE INDEX IF NOT EXISTS idx_tickers_sector ON tickers(sector);
 CREATE INDEX IF NOT EXISTS idx_tickers_board ON tickers(board);
+CREATE INDEX IF NOT EXISTS idx_idx_broker_date ON idx_broker_summary(date);
+CREATE INDEX IF NOT EXISTS idx_idx_index_date ON idx_index_summary(date);
 """
 
 
@@ -128,12 +181,24 @@ def _get_raw_conn():
     return engine.raw_connection()
 
 
+# ── Upsert Functions ──
+
 def upsert_prices(df: pd.DataFrame) -> int:
     if df.empty:
         return 0
     df = _clean_numeric_df(df)
     df["date"] = pd.to_datetime(df["date"]).dt.date.astype(str)
-    cols = ["date", "ticker", "open", "high", "low", "close", "volume"]
+    
+    # Added new IDX columns
+    cols = [
+        "date", "ticker", "open", "high", "low", "close", "volume", 
+        "foreign_buy", "foreign_sell", "value", "frequency", 
+        "non_regular_volume", "non_regular_value"
+    ]
+    for c in cols:
+        if c not in df.columns:
+            df[c] = None
+            
     rows = [tuple(row) for row in df[cols].values]
 
     raw_conn = _get_raw_conn()
@@ -142,14 +207,24 @@ def upsert_prices(df: pd.DataFrame) -> int:
             execute_values(
                 cur,
                 """
-                INSERT INTO prices (date, ticker, open, high, low, close, volume)
+                INSERT INTO prices (
+                    date, ticker, open, high, low, close, volume,
+                    foreign_buy, foreign_sell, value, frequency,
+                    non_regular_volume, non_regular_value
+                )
                 VALUES %s
                 ON CONFLICT (date, ticker) DO UPDATE SET
                     open = EXCLUDED.open,
                     high = EXCLUDED.high,
                     low = EXCLUDED.low,
                     close = EXCLUDED.close,
-                    volume = EXCLUDED.volume
+                    volume = EXCLUDED.volume,
+                    foreign_buy = COALESCE(EXCLUDED.foreign_buy, prices.foreign_buy),
+                    foreign_sell = COALESCE(EXCLUDED.foreign_sell, prices.foreign_sell),
+                    value = COALESCE(EXCLUDED.value, prices.value),
+                    frequency = COALESCE(EXCLUDED.frequency, prices.frequency),
+                    non_regular_volume = COALESCE(EXCLUDED.non_regular_volume, prices.non_regular_volume),
+                    non_regular_value = COALESCE(EXCLUDED.non_regular_value, prices.non_regular_value)
                 """,
                 rows,
                 page_size=2000,
@@ -262,6 +337,141 @@ def upsert_broker_activity(df: pd.DataFrame) -> int:
     return len(df)
 
 
+def upsert_idx_broker_summary(df: pd.DataFrame) -> int:
+    if df.empty:
+        return 0
+    df = _clean_numeric_df(df)
+    df["date"] = pd.to_datetime(df["date"]).dt.date.astype(str)
+    cols = ["date", "id_firm", "firm_name", "volume", "value", "frequency"]
+    for c in cols:
+        if c not in df.columns:
+            df[c] = None
+    rows = [tuple(row) for row in df[cols].values]
+
+    raw_conn = _get_raw_conn()
+    try:
+        with raw_conn.cursor() as cur:
+            execute_values(
+                cur,
+                """
+                INSERT INTO idx_broker_summary (date, id_firm, firm_name, volume, value, frequency)
+                VALUES %s
+                ON CONFLICT (date, id_firm) DO UPDATE SET
+                    firm_name = EXCLUDED.firm_name,
+                    volume = EXCLUDED.volume,
+                    value = EXCLUDED.value,
+                    frequency = EXCLUDED.frequency
+                """,
+                rows,
+                page_size=2000,
+            )
+        raw_conn.commit()
+    finally:
+        raw_conn.close()
+    return len(df)
+
+
+def upsert_idx_index_summary(df: pd.DataFrame) -> int:
+    if df.empty:
+        return 0
+    df = _clean_numeric_df(df)
+    df["date"] = pd.to_datetime(df["date"]).dt.date.astype(str)
+    cols = ["date", "index_code", "index_name", "close", "volume", "value", "market_cap"]
+    for c in cols:
+        if c not in df.columns:
+            df[c] = None
+    rows = [tuple(row) for row in df[cols].values]
+
+    raw_conn = _get_raw_conn()
+    try:
+        with raw_conn.cursor() as cur:
+            execute_values(
+                cur,
+                """
+                INSERT INTO idx_index_summary (date, index_code, index_name, close, volume, value, market_cap)
+                VALUES %s
+                ON CONFLICT (date, index_code) DO UPDATE SET
+                    index_name = EXCLUDED.index_name,
+                    close = EXCLUDED.close,
+                    volume = EXCLUDED.volume,
+                    value = EXCLUDED.value,
+                    market_cap = EXCLUDED.market_cap
+                """,
+                rows,
+                page_size=2000,
+            )
+        raw_conn.commit()
+    finally:
+        raw_conn.close()
+    return len(df)
+
+
+def upsert_financial_ratios(df: pd.DataFrame) -> int:
+    if df.empty:
+        return 0
+    df = _clean_numeric_df(df)
+    cols = ["code", "year", "quarter", "per", "pbv", "roe", "roa", "der", "eps"]
+    for c in cols:
+        if c not in df.columns:
+            df[c] = None
+    rows = [tuple(row) for row in df[cols].values]
+
+    raw_conn = _get_raw_conn()
+    try:
+        with raw_conn.cursor() as cur:
+            execute_values(
+                cur,
+                """
+                INSERT INTO financial_ratios (code, year, quarter, per, pbv, roe, roa, der, eps)
+                VALUES %s
+                ON CONFLICT (code, year, quarter) DO UPDATE SET
+                    per = EXCLUDED.per,
+                    pbv = EXCLUDED.pbv,
+                    roe = EXCLUDED.roe,
+                    roa = EXCLUDED.roa,
+                    der = EXCLUDED.der,
+                    eps = EXCLUDED.eps
+                """,
+                rows,
+                page_size=2000,
+            )
+        raw_conn.commit()
+    finally:
+        raw_conn.close()
+    return len(df)
+
+
+def upsert_corporate_actions(df: pd.DataFrame) -> int:
+    if df.empty:
+        return 0
+    df = _clean_numeric_df(df)
+    df["date"] = pd.to_datetime(df["date"]).dt.date.astype(str)
+    cols = ["date", "ticker", "ca_type", "description"]
+    for c in cols:
+        if c not in df.columns:
+            df[c] = None
+    rows = [tuple(row) for row in df[cols].values]
+
+    raw_conn = _get_raw_conn()
+    try:
+        with raw_conn.cursor() as cur:
+            execute_values(
+                cur,
+                """
+                INSERT INTO corporate_actions (date, ticker, ca_type, description)
+                VALUES %s
+                ON CONFLICT (date, ticker, ca_type) DO UPDATE SET
+                    description = EXCLUDED.description
+                """,
+                rows,
+                page_size=2000,
+            )
+        raw_conn.commit()
+    finally:
+        raw_conn.close()
+    return len(df)
+
+
 def log_run(tickers: list[str], n_prices: int, n_broker: int, notes: str = "") -> None:
     init_db()
     with engine.begin() as conn:
@@ -279,6 +489,8 @@ def log_run(tickers: list[str], n_prices: int, n_broker: int, notes: str = "") -
             },
         )
 
+
+# ── Read Functions ──
 
 def read_prices(
     tickers: Sequence[str] | None = None,
@@ -351,6 +563,77 @@ def read_broker_activity(
 
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
     q = f"SELECT * FROM broker_activity{where} ORDER BY ticker, date ASC, net_value DESC"
+    with engine.connect() as conn:
+        return pd.read_sql(text(q), conn, params=params, parse_dates=["date"])
+
+
+def read_idx_broker_summary(
+    start_date: str | date | None = None,
+    end_date: str | date | None = None,
+) -> pd.DataFrame:
+    """Read IDX aggregate broker summary."""
+    init_db()
+    clauses = []
+    params: dict[str, object] = {}
+    if start_date:
+        clauses.append("date >= :start_date")
+        params["start_date"] = str(start_date)
+    if end_date:
+        clauses.append("date <= :end_date")
+        params["end_date"] = str(end_date)
+
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    q = f"SELECT * FROM idx_broker_summary{where} ORDER BY date DESC, value DESC"
+    with engine.connect() as conn:
+        return pd.read_sql(text(q), conn, params=params, parse_dates=["date"])
+
+
+def read_idx_index_summary(
+    start_date: str | date | None = None,
+    end_date: str | date | None = None,
+) -> pd.DataFrame:
+    """Read IDX index summary."""
+    init_db()
+    clauses = []
+    params: dict[str, object] = {}
+    if start_date:
+        clauses.append("date >= :start_date")
+        params["start_date"] = str(start_date)
+    if end_date:
+        clauses.append("date <= :end_date")
+        params["end_date"] = str(end_date)
+
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    q = f"SELECT * FROM idx_index_summary{where} ORDER BY date ASC, index_code ASC"
+    with engine.connect() as conn:
+        return pd.read_sql(text(q), conn, params=params, parse_dates=["date"])
+
+
+def read_financial_ratios() -> pd.DataFrame:
+    """Read financial ratios."""
+    init_db()
+    q = "SELECT * FROM financial_ratios"
+    with engine.connect() as conn:
+        return pd.read_sql(text(q), conn)
+
+
+def read_corporate_actions(
+    start_date: str | date | None = None,
+    end_date: str | date | None = None,
+) -> pd.DataFrame:
+    """Read corporate actions."""
+    init_db()
+    clauses = []
+    params: dict[str, object] = {}
+    if start_date:
+        clauses.append("date >= :start_date")
+        params["start_date"] = str(start_date)
+    if end_date:
+        clauses.append("date <= :end_date")
+        params["end_date"] = str(end_date)
+
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    q = f"SELECT * FROM corporate_actions{where} ORDER BY date DESC"
     with engine.connect() as conn:
         return pd.read_sql(text(q), conn, params=params, parse_dates=["date"])
 

@@ -2,9 +2,9 @@
 
 Supports multiple universe modes:
   * "watchlist"   -> config.WATCHLIST (legacy 10 tickers)
-  * "idx30"       -> IDX30 constituents
-  * "lq45"        -> LQ45 constituents
-  * "idx80"       -> IDX80 constituents
+  * "idx30"       -> IDX30 constituents (Live API + Fallback)
+  * "lq45"        -> LQ45 constituents (Live API + Fallback)
+  * "idx80"       -> IDX80 constituents (Live API + Fallback)
   * "liquid"      -> Top liquid stocks by daily value
   * "all"         -> All listed companies (~900 tickers) from BEI API
   * "custom"      -> User-defined comma-separated list
@@ -290,20 +290,38 @@ def get_master_tickers(active_only: bool = True) -> list[str]:
 
 
 def get_universe(mode: str = "watchlist", custom_list: list[str] | None = None) -> list[str]:
-    """Resolve a universe mode into a concrete list of tickers."""
+    """Resolve a universe mode into a concrete list of tickers.
+    
+    Jika mode adalah idx30/lq45/idx80, akan menembak API IDX secara live.
+    Jika API gagal, akan menggunakan daftar hardcoded fallback.
+    """
     mode = (mode or "watchlist").lower().strip()
 
     if mode == "watchlist":
         return sorted({t.upper() for t in config.WATCHLIST})
 
-    if mode == "idx30":
-        return sorted({t.upper() for t in _IDX30})
-
-    if mode == "lq45":
-        return sorted({t.upper() for t in _LQ45})
-
-    if mode == "idx80":
-        return sorted({t.upper() for t in _IDX80})
+    # ── AMBIL DAFTAR INDEX LANGSUNG DARI API IDX ──
+    index_map = {
+        "idx30": "IDX30",
+        "lq45": "LQ45",
+        "idx80": "IDX80"
+    }
+    
+    if mode in index_map:
+        # Coba ambil dari API BEI secara live
+        live_constituents = _fetch_bei_constituent(index_map[mode])
+        if live_constituents:
+            print(f"[universe] Menggunakan daftar {mode} live dari BEI ({len(live_constituents)} saham).")
+            return sorted(live_constituents)
+        
+        # Jika API BEI gagal/down, gunakan hardcoded fallback
+        print(f"[universe] API BEI gagal, menggunakan daftar {mode} fallback lokal.")
+        hardcoded_map = {
+            "idx30": _IDX30,
+            "lq45": _LQ45,
+            "idx80": _IDX80
+        }
+        return sorted({t.upper() for t in hardcoded_map[mode]})
 
     if mode == "custom":
         if not custom_list:

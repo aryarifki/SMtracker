@@ -1,7 +1,6 @@
-"""IDX API Client - Hybrid (Sync & Async) dengan WAF Bypass (curl_cffi)."""
+"""IDX API Client - Hybrid (Sync) dengan WAF Bypass (curl_cffi) & Rate Limiter."""
 
 from __future__ import annotations
-import asyncio
 import time
 from datetime import date, timedelta
 import pandas as pd
@@ -20,57 +19,31 @@ def _fetch(endpoint: str, params: dict = None, retries: int = 5) -> dict | None:
     url = f"{_BASE}{endpoint}"
     for attempt in range(retries):
         try:
+            # Jeda wajib 2 detik sebelum setiap request ke IDX
+            time.sleep(2.0)
+            
             resp = requests.get(url, params=params, headers=_HEADERS, impersonate="chrome", timeout=20)
+            
             if resp.status_code == 200:
                 return resp.json()
             elif resp.status_code == 429:
-                # Jeda lebih lama untuk 429: 5s, 10s, 20s, 40s, 80s
-                wait_time = 5 * (2 ** attempt)
-                print(f"[idx_api] ⚠️ HTTP 429 (Rate Limit). Menunggu {wait_time}s sebelum retry...")
-                time.sleep(wait_time)
+                # Jika kena 429, tidur 60 detik agar penalti IP dicabut
+                print(f"[idx_api] ⚠️ HTTP 429 (Rate Limit). IP terkena penalti. Menunggu 60s...")
+                time.sleep(60)
                 continue
             else:
                 print(f"[idx_api] HTTP {resp.status_code} on {endpoint}")
                 return None
         except Exception as e:
             if attempt < retries - 1:
-                time.sleep(2 ** attempt)
+                time.sleep(5)
             else:
                 print(f"[idx_api] Error fetching {endpoint}: {e}")
                 return None
     print(f"[idx_api] ❌ Gagal mengambil {endpoint} setelah {retries}x retry.")
     return None
 
-async def _async_fetch(session: requests.AsyncSession, endpoint: str, params: dict = None) -> dict | None:
-    """Fetch data dari idx.co.id secara async dengan browser impersonation & retry 429."""
-    url = f"{_BASE}{endpoint}"
-    max_retries = 3
-    
-    for attempt in range(max_retries):
-        try:
-            resp = await session.get(url, params=params, headers=_HEADERS, impersonate="chrome", timeout=20)
-            
-            # ── HANDLING RATE LIMIT (429) ──
-            if resp.status_code == 429:
-                wait_time = 2 ** attempt  # 2s, 4s, 8s
-                print(f"[idx_async] ⚠️ HTTP 429 (Rate Limit). Menunggu {wait_time}s sebelum retry...")
-                await asyncio.sleep(wait_time)
-                continue
-                
-            if resp.status_code == 200:
-                return resp.json()
-            else:
-                print(f"[idx_async] HTTP {resp.status_code} on {endpoint}")
-                return None
-                
-        except Exception as e:
-            print(f"[idx_async] Error fetching {endpoint}: {e}")
-            return None
-            
-    print(f"[idx_async] ❌ Gagal mengambil {endpoint} setelah {max_retries}x retry.")
-    return None
-    
-# ── PARSER DATAframe ──
+# ── PARSER DATAFRAME ──
 def _parse_stock_data(data: dict, date_iso: str) -> pd.DataFrame:
     if not data or not data.get("data"): return pd.DataFrame()
     df = pd.DataFrame(data["data"])
@@ -117,9 +90,6 @@ def ingest_idx_daily_data(target_date: date):
         storage.upsert_prices(df_stock)
         print(f"[idx_api] ✅ Stock: {len(df_stock)} baris.")
         
-    # Jeda 0.5 detik antar endpoint
-    time.sleep(0.5)
-        
     # 2. Broker Summary (Aggregate)
     broker_data = _fetch("/TradingSummary/GetBrokerSummary", params={"date": date_str_api, "start": 0, "length": 9999})
     df_broker = _parse_broker_data(broker_data, date_iso)
@@ -127,58 +97,12 @@ def ingest_idx_daily_data(target_date: date):
         storage.upsert_idx_broker_summary(df_broker)
         print(f"[idx_api] ✅ Broker: {len(df_broker)} baris.")
         
-    # Jeda 0.5 detik antar endpoint
-    time.sleep(0.5)
-        
     # 3. Index Summary (IHSG, LQ45)
     index_data = _fetch("/TradingSummary/GetIndexSummary", params={"date": date_str_api, "start": 0, "length": 9999})
     df_index = _parse_index_data(index_data, date_iso)
     if not df_index.empty:
         storage.upsert_idx_index_summary(df_index)
         print(f"[idx_api] ✅ Index: {len(df_index)} baris.")
-        
-# ── FUNGSI ASINKRONUS (BACKFILL HISTORIK CEPAT) ──
-async def _process_single_date_async(session: requests.AsyncSession, sem: asyncio.Semaphore, target_date: date):
-    date_str_api = target_date.strftime("%Y%m%d")
-    date_iso = target_date.isoformat()
-    
-    async with sem:
-        stock_data = await _async_fetch(session, "/TradingSummary/GetStockSummary", params={"date": date_str_api, "start": 0, "length": 9999})
-        df_stock = _parse_stock_data(stock_data, date_iso)
-        if not df_stock.empty:
-            await asyncio.to_thread(storage.upsert_prices, df_stock)
-            
-        broker_data = await _async_fetch(session, "/TradingSummary/GetBrokerSummary", params={"date": date_str_api, "start": 0, "length": 9999})
-        df_broker = _parse_broker_data(broker_data, date_iso)
-        if not df_broker.empty:
-            await asyncio.to_thread(storage.upsert_idx_broker_summary, df_broker)
-            
-        index_data = await _async_fetch(session, "/TradingSummary/GetIndexSummary", params={"date": date_str_api, "start": 0, "length": 9999})
-        df_index = _parse_index_data(index_data, date_iso)
-        if not df_index.empty:
-            await asyncio.to_thread(storage.upsert_idx_index_summary, df_index)
-            
-    print(f"[idx_async] ✅ Selesai: {date_iso}")
-
-async def async_backfill_idx_history(start_date: date, end_date: date, concurrency: int = 8):
-    """Backfill historik penuh async (concurrency=8)."""
-    dates = []
-    current = start_date
-    while current <= end_date:
-        if current.weekday() < 5:
-            dates.append(current)
-        current += timedelta(days=1)
-        
-    print(f"[idx_async] 🚀 Async Backfill IDX: {len(dates)} hari kerja (Concurrency: {concurrency})")
-    
-    async with requests.AsyncSession() as session:
-        sem = asyncio.Semaphore(concurrency)
-        tasks = [_process_single_date_async(session, sem, d) for d in dates]
-        await asyncio.gather(*tasks)
-
-def run_async_backfill(start_date: date, end_date: date, concurrency: int = 8):
-    """Wrapper untuk menjalankan async dari CLI sinkronus."""
-    asyncio.run(async_backfill_idx_history(start_date, end_date, concurrency))
 
 
 # ── FUNGSI SNAPSHOT FUNDAMENTAL & GOVERNANCE ──
@@ -267,4 +191,6 @@ def ingest_all_company_details(concurrency: int = 5):
                 else: fail_count += 1
             except Exception: fail_count += 1
             if i % 50 == 0: print(f"   - Progress: {i}/{len(tickers)} (Success: {success_count}, Fail: {fail_count})")
+    
+    # Perbaikan typo di baris terakhir (hapus tanda } yang berlebih)
     print(f"[idx_api] ✅ Company Details selesai! Total Sukses: {success_count}, Gagal: {fail_count}")

@@ -98,31 +98,40 @@ def _parse_index_data(data: dict, date_iso: str) -> pd.DataFrame:
     df["date"] = date_iso
     return df
 
-# ── FUNGSI SINKRONUS (HARIAN) ──
+# ── FUNGSI SINKRONUS (HARIAN & BACKFILL SEQUENTIAL) ──
 def ingest_idx_daily_data(target_date: date):
     """Mengambil OHLCV, Broker, dan Index untuk 1 hari spesifik (Sync)."""
     date_str_api = target_date.strftime("%Y%m%d")
     date_iso = target_date.isoformat()
     print(f"[idx_api] 📅 Mengambil data IDX Harian: {date_iso}")
     
+    # 1. Stock Summary (OHLCV + Foreign Flow)
     stock_data = _fetch("/TradingSummary/GetStockSummary", params={"date": date_str_api, "start": 0, "length": 9999})
     df_stock = _parse_stock_data(stock_data, date_iso)
     if not df_stock.empty:
         storage.upsert_prices(df_stock)
         print(f"[idx_api] ✅ Stock: {len(df_stock)} baris.")
         
+    # Jeda 0.5 detik antar endpoint
+    time.sleep(0.5)
+        
+    # 2. Broker Summary (Aggregate)
     broker_data = _fetch("/TradingSummary/GetBrokerSummary", params={"date": date_str_api, "start": 0, "length": 9999})
     df_broker = _parse_broker_data(broker_data, date_iso)
     if not df_broker.empty:
         storage.upsert_idx_broker_summary(df_broker)
         print(f"[idx_api] ✅ Broker: {len(df_broker)} baris.")
         
+    # Jeda 0.5 detik antar endpoint
+    time.sleep(0.5)
+        
+    # 3. Index Summary (IHSG, LQ45)
     index_data = _fetch("/TradingSummary/GetIndexSummary", params={"date": date_str_api, "start": 0, "length": 9999})
     df_index = _parse_index_data(index_data, date_iso)
     if not df_index.empty:
         storage.upsert_idx_index_summary(df_index)
         print(f"[idx_api] ✅ Index: {len(df_index)} baris.")
-
+        
 # ── FUNGSI ASINKRONUS (BACKFILL HISTORIK CEPAT) ──
 async def _process_single_date_async(session: requests.AsyncSession, sem: asyncio.Semaphore, target_date: date):
     date_str_api = target_date.strftime("%Y%m%d")

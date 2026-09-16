@@ -154,23 +154,27 @@ def ingest_corporate_actions():
         cols = ["date", "ticker", "ca_type", "description"]
         for c in cols:
             if c not in df.columns: df[c] = None
+        
+        # ── HAPUS DUPLIKAT DARI DATA MENTAH IDX ──
+        df = df.drop_duplicates(subset=cols, keep='last')
+        
         storage.upsert_corporate_actions(df[cols])
         print(f"[idx_api] ✅ Corporate Actions: {len(df)} baris disimpan.")
 
 def ingest_company_details(ticker: str):
     data = _fetch("/ListedCompany/GetCompanyProfilesDetail", params={"KodeEmiten": ticker, "language": "id-id"})
     if not data or not data.get("Profiles") or len(data["Profiles"]) == 0: return False
-    profile = data["Profiles"][0]
     
-    shareholders = profile.get("PemegangSaham", [])
+    # Ambil data langsung dari root 'data', bukan dari 'Profiles[0]'
+    shareholders = data.get("PemegangSaham", [])
     if shareholders:
         sh_rows = [{"ticker": ticker, "name": (s.get("Nama") or "").strip(), "pct": float(s.get("Persentase") or 0.0), "is_controlling": bool(s.get("Pengendali", False))} for s in shareholders]
         if sh_rows: storage.upsert_company_shareholders(pd.DataFrame(sh_rows))
         
     board_rows = []
-    for d in profile.get("Direksi", []):
+    for d in data.get("Direksi", []):
         board_rows.append({"ticker": ticker, "name": (d.get("Nama") or "").strip(), "role": "Director", "title": (d.get("Jabatan") or "").strip()})
-    for k in profile.get("DewanKomisaris", []):
+    for k in data.get("DewanKomisaris", []):
         board_rows.append({"ticker": ticker, "name": (k.get("Nama") or "").strip(), "role": "Commissioner", "title": (k.get("Jabatan") or "").strip()})
     if board_rows: storage.upsert_company_board(pd.DataFrame(board_rows))
     return True
@@ -192,5 +196,4 @@ def ingest_all_company_details(concurrency: int = 5):
             except Exception: fail_count += 1
             if i % 50 == 0: print(f"   - Progress: {i}/{len(tickers)} (Success: {success_count}, Fail: {fail_count})")
     
-    # Perbaikan typo di baris terakhir (hapus tanda } yang berlebih)
     print(f"[idx_api] ✅ Company Details selesai! Total Sukses: {success_count}, Gagal: {fail_count}")

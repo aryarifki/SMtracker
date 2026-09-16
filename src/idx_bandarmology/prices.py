@@ -2,73 +2,33 @@
 
 from __future__ import annotations
 
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from curl_cffi import requests as cffi_requests  # Menggunakan curl_cffi anti-WAF
 
-_SESSION_LOCK = threading.Lock()
-_SHARED_SESSION: requests.Session | None = None
-_SESSION_READY = False
-
-
-def _get_idx_session() -> requests.Session:
-    """Reuses a singleton Session with connection pooling and WAF bypass."""
-    global _SHARED_SESSION, _SESSION_READY
-    with _SESSION_LOCK:
-        if _SHARED_SESSION is not None and _SESSION_READY:
-            return _SHARED_SESSION
-
-        session = requests.Session()
-        retry_strategy = Retry(
-            total=3,
-            backoff_factor=0.5,
-            status_forcelist=[429, 500, 502, 503, 504],
-        )
-        adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=retry_strategy)
-        session.mount("https://", adapter)
-        
-        session.headers.update({
-            'Accept': 'application/json, text/plain, */*',
-            'Accept-Language': 'en-US,en;q=0.9,id;q=0.8',
-            'Referer': 'https://www.idx.co.id/',
-            'Upgrade-Insecure-Requests': '1',
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36'
-        })
-        
-        # ── SESSION WARMING (Bypass WAF) ──
-        try:
-            session.get("https://www.idx.co.id/id", timeout=15.0)
-            time.sleep(1)
-            session.headers.update({'X-Requested-With': 'XMLHttpRequest'})
-            session.get("https://www.idx.co.id/primary/home/GetIndexList", timeout=15.0)
-            time.sleep(1)
-            _SESSION_READY = True
-        except Exception as e:
-            print(f"[prices] Session warmup notice: {e}")
-        
-        _SHARED_SESSION = session
-        return _SHARED_SESSION
+# Headers standar untuk meniru browser
+_HEADERS = {
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9,id;q=0.8",
+    "Referer": "https://www.idx.co.id/",
+}
 
 
 def fetch_history(ticker: str, period: str = "1y", interval: str = "1d") -> pd.DataFrame:
     """Daily OHLCV for one ticker fetched directly from IDX."""
     cols = ["date", "ticker", "open", "high", "low", "close", "volume"]
     sym = ticker.upper().strip().replace(".JK", "")
-    session = _get_idx_session()
     
     max_retries = 3
     url = f"https://www.idx.co.id/primary/ListedCompany/GetTradingInfoSS?code={sym}&start=0&length=1000"
     
     for attempt in range(max_retries):
         try:
-            resp = session.get(url, timeout=15.0)
+            # Kunci sukses: impersonate="chrome" agar WAF IDX mengira ini browser asli
+            resp = cffi_requests.get(url, headers=_HEADERS, impersonate="chrome", timeout=15.0)
             
-            # ── Tambahan: Cek status code secara eksplisit ──
             if resp.status_code != 200:
                 print(f"[prices] HTTP {resp.status_code} on {sym} (attempt {attempt+1})")
                 if attempt == max_retries - 1:
@@ -76,7 +36,7 @@ def fetch_history(ticker: str, period: str = "1y", interval: str = "1d") -> pd.D
                 time.sleep(min(1000 * (2 ** attempt) / 1000, 15))
                 continue
                 
-            # ── Tambahan: Cek apakah response benar-benar JSON ──
+            # Cek apakah response benar-benar JSON
             try:
                 data = resp.json()
             except ValueError:
@@ -115,7 +75,7 @@ def fetch_history_many(
     tickers: list[str],
     period: str = "1y",
     interval: str = "1d",
-    max_workers: int = 3,       # <--- Diturunkan jadi 3 agar tidak kena ban DDoS
+    max_workers: int = 3,       # Diturunkan jadi 3 agar tidak kena ban DDoS
     batch_size: int = 50,
 ) -> int:
     """Fetch multiple tickers concurrently, save to DB per batch, and return row count."""

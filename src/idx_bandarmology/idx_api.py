@@ -159,20 +159,55 @@ def ingest_corporate_actions():
 
 def ingest_company_details(ticker: str):
     data = _fetch("/ListedCompany/GetCompanyProfilesDetail", params={"KodeEmiten": ticker, "language": "id-id"})
-    if not data or not data.get("Profiles") or len(data["Profiles"]) == 0: return False
+    if not data or not data.get("Profiles") or len(data["Profiles"]) == 0: 
+        return False
+    
+    # Ambil data dari Profiles[0]
     profile = data["Profiles"][0]
     
-    shareholders = profile.get("PemegangSaham", [])
-    if shareholders:
-        sh_rows = [{"ticker": ticker, "name": (s.get("Nama") or "").strip(), "pct": float(s.get("Persentase") or 0.0), "is_controlling": bool(s.get("Pengendali", False))} for s in shareholders]
-        if sh_rows: storage.upsert_company_shareholders(pd.DataFrame(sh_rows))
+    # 1. Pemegang Saham
+    sh_rows = []
+    for s in profile.get("PemegangSaham", []):
+        try:
+            sh_rows.append({
+                "ticker": ticker,
+                "name": str(s.get("Nama", "") or "").strip(),
+                "pct": float(s.get("Persentase", 0.0) or 0.0),
+                "is_controlling": bool(s.get("Pengendali", False))
+            })
+        except Exception:
+            continue # Skip baris jika ada data rusak
+            
+    if sh_rows: 
+        storage.upsert_company_shareholders(pd.DataFrame(sh_rows))
         
+    # 2. Direksi & Komisaris
     board_rows = []
     for d in profile.get("Direksi", []):
-        board_rows.append({"ticker": ticker, "name": (d.get("Nama") or "").strip(), "role": "Director", "title": (d.get("Jabatan") or "").strip()})
+        try:
+            board_rows.append({
+                "ticker": ticker, 
+                "name": str(d.get("Nama", "") or "").strip(), 
+                "role": "Director", 
+                "title": str(d.get("Jabatan", "") or "").strip()
+            })
+        except Exception:
+            continue
+            
     for k in profile.get("DewanKomisaris", []):
-        board_rows.append({"ticker": ticker, "name": (k.get("Nama") or "").strip(), "role": "Commissioner", "title": (k.get("Jabatan") or "").strip()})
-    if board_rows: storage.upsert_company_board(pd.DataFrame(board_rows))
+        try:
+            board_rows.append({
+                "ticker": ticker, 
+                "name": str(k.get("Nama", "") or "").strip(), 
+                "role": "Commissioner", 
+                "title": str(k.get("Jabatan", "") or "").strip()
+            })
+        except Exception:
+            continue
+            
+    if board_rows: 
+        storage.upsert_company_board(pd.DataFrame(board_rows))
+        
     return True
 
 def ingest_all_company_details(concurrency: int = 5):

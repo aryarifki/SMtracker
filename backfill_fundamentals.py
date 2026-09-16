@@ -21,7 +21,7 @@ def main():
     parser.add_argument("--year", type=int, default=datetime.date.today().year, help="Tahun laporan keuangan")
     parser.add_argument("--quarter", type=int, default=4, help="Kuartal laporan keuangan")
     parser.add_argument("--all-years", action="store_true", help="Ambil Financial Ratios untuk 3 tahun terakhir + tahun berjalan")
-    parser.add_argument("--concurrency", type=int, default=5, help="Jumlah concurrent request untuk details")
+    parser.add_argument("--concurrency", type=int, default=1, help="Jumlah concurrent request untuk details")
     
     args = parser.parse_args()
     

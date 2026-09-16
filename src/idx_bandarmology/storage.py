@@ -145,18 +145,123 @@ CREATE TABLE IF NOT EXISTS corporate_actions (
 -- Indeks komposit dan indeks tanggal tunggal untuk akselerasi query
 CREATE INDEX IF NOT EXISTS idx_prices_ticker_date ON prices(ticker, date);
 CREATE INDEX IF NOT EXISTS idx_prices_date ON prices(date);
-CREATE INDEX IF NOT EXISTS idx_broker_flow_ticker_date ON broker_flow(ticker, date);
-CREATE INDEX IF NOT EXISTS idx_broker_flow_date ON broker_flow(date);
-CREATE INDEX IF NOT EXISTS idx_broker_activity_ticker_date ON broker_activity(ticker, date);
-CREATE INDEX IF NOT EXISTS idx_broker_activity_date ON broker_activity(date);
-CREATE INDEX IF NOT EXISTS idx_broker_activity_broker ON broker_activity(broker_code);
-CREATE INDEX IF NOT EXISTS idx_tickers_sector ON tickers(sector);
-CREATE INDEX IF NOT EXISTS idx_tickers_board ON tickers(board);
-CREATE INDEX IF NOT EXISTS idx_idx_broker_date ON idx_broker_summary(date);
-CREATE INDEX IF NOT EXISTS idx_idx_index_date ON idx_index_summary(date);
-"""
+# ── schema ───────────────────────────────────────────────────────────────────
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS prices (
+    date    DATE NOT NULL,
+    ticker  VARCHAR(20) NOT NULL,
+    open    NUMERIC,
+    high    NUMERIC,
+    low     NUMERIC,
+    close   NUMERIC,
+    volume  BIGINT,
+    PRIMARY KEY (date, ticker)
+);
 
--- ── Governance Tables ──
+-- Alter existing prices table for IDX OHLCV + Foreign Flow + Pasar Nego
+ALTER TABLE prices ADD COLUMN IF NOT EXISTS foreign_buy BIGINT;
+ALTER TABLE prices ADD COLUMN IF NOT EXISTS foreign_sell BIGINT;
+ALTER TABLE prices ADD COLUMN IF NOT EXISTS value BIGINT;
+ALTER TABLE prices ADD COLUMN IF NOT EXISTS frequency INTEGER;
+ALTER TABLE prices ADD COLUMN IF NOT EXISTS non_regular_volume BIGINT;
+ALTER TABLE prices ADD COLUMN IF NOT EXISTS non_regular_value BIGINT;
+
+CREATE TABLE IF NOT EXISTS broker_flow (
+    date                DATE NOT NULL,
+    ticker              VARCHAR(20) NOT NULL,
+    bandar_signal       VARCHAR(50),
+    bandar_signal_score NUMERIC,
+    foreign_net_broker  NUMERIC,
+    local_net_broker    NUMERIC,
+    gov_net_broker      NUMERIC,
+    foreign_net_flow    NUMERIC,
+    domestic_net_flow   NUMERIC,
+    total_value         NUMERIC,
+    foreign_signal      VARCHAR(50),
+    conclusion_broker   TEXT,
+    conclusion_flow     TEXT,
+    fetched_at          TIMESTAMP,
+    PRIMARY KEY (date, ticker)
+);
+
+CREATE TABLE IF NOT EXISTS broker_activity (
+    date             DATE NOT NULL,
+    ticker           VARCHAR(20) NOT NULL,
+    broker_code      VARCHAR(20) NOT NULL,
+    participant_type VARCHAR(20),
+    buy_value        NUMERIC,
+    sell_value       NUMERIC,
+    net_value        NUMERIC,
+    buy_lot          NUMERIC,
+    sell_lot         NUMERIC,
+    frequency        NUMERIC,
+    buy_avg_price    NUMERIC,
+    sell_avg_price   NUMERIC,
+    fetched_at       TIMESTAMP,
+    PRIMARY KEY (date, ticker, broker_code)
+);
+
+CREATE TABLE IF NOT EXISTS runs (
+    run_at   TIMESTAMP NOT NULL,
+    tickers  TEXT,
+    n_prices INTEGER,
+    n_broker INTEGER,
+    notes    TEXT
+);
+
+CREATE TABLE IF NOT EXISTS tickers (
+    ticker      VARCHAR(20) PRIMARY KEY,
+    name        VARCHAR(200),
+    board       VARCHAR(50),
+    sector      VARCHAR(100),
+    is_active   BOOLEAN DEFAULT TRUE,
+    updated_at  TIMESTAMP
+);
+
+-- IDX Direct API Tables
+CREATE TABLE IF NOT EXISTS idx_broker_summary (
+    date DATE NOT NULL,
+    id_firm VARCHAR(20) NOT NULL,
+    firm_name VARCHAR(200),
+    volume BIGINT,
+    value BIGINT,
+    frequency INTEGER,
+    PRIMARY KEY (date, id_firm)
+);
+
+CREATE TABLE IF NOT EXISTS idx_index_summary (
+    date DATE NOT NULL,
+    index_code VARCHAR(20) NOT NULL,
+    index_name VARCHAR(100),
+    close NUMERIC,
+    volume BIGINT,
+    value BIGINT,
+    market_cap NUMERIC,
+    PRIMARY KEY (date, index_code)
+);
+
+CREATE TABLE IF NOT EXISTS financial_ratios (
+    code VARCHAR(20) NOT NULL,
+    year INT NOT NULL,
+    quarter INT NOT NULL,
+    per NUMERIC,
+    pbv NUMERIC,
+    roe NUMERIC,
+    roa NUMERIC,
+    der NUMERIC,
+    eps NUMERIC,
+    PRIMARY KEY (code, year, quarter)
+);
+
+CREATE TABLE IF NOT EXISTS corporate_actions (
+    date DATE NOT NULL,
+    ticker VARCHAR(20) NOT NULL,
+    ca_type VARCHAR(50) NOT NULL,
+    description TEXT,
+    PRIMARY KEY (date, ticker, ca_type)
+);
+
+-- Governance Tables
 CREATE TABLE IF NOT EXISTS company_shareholders (
     ticker VARCHAR(20) NOT NULL,
     name VARCHAR(200) NOT NULL,
@@ -172,6 +277,19 @@ CREATE TABLE IF NOT EXISTS company_board (
     title VARCHAR(100),
     PRIMARY KEY (ticker, name, role, title)
 );
+
+-- Indeks komposit dan indeks tanggal tunggal untuk akselerasi query
+CREATE INDEX IF NOT EXISTS idx_prices_ticker_date ON prices(ticker, date);
+CREATE INDEX IF NOT EXISTS idx_prices_date ON prices(date);
+CREATE INDEX IF NOT EXISTS idx_broker_flow_ticker_date ON broker_flow(ticker, date);
+CREATE INDEX IF NOT EXISTS idx_broker_flow_date ON broker_flow(date);
+CREATE INDEX IF NOT EXISTS idx_broker_activity_ticker_date ON broker_activity(ticker, date);
+CREATE INDEX IF NOT EXISTS idx_broker_activity_date ON broker_activity(date);
+CREATE INDEX IF NOT EXISTS idx_broker_activity_broker ON broker_activity(broker_code);
+CREATE INDEX IF NOT EXISTS idx_tickers_sector ON tickers(sector);
+CREATE INDEX IF NOT EXISTS idx_tickers_board ON tickers(board);
+CREATE INDEX IF NOT EXISTS idx_idx_broker_date ON idx_broker_summary(date);
+CREATE INDEX IF NOT EXISTS idx_idx_index_date ON idx_index_summary(date);
 
 def init_db() -> None:
     """Create tables and indexes if they don't exist yet."""

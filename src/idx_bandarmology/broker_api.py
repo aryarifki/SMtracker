@@ -530,7 +530,11 @@ def fetch_historical_broker_data(
     from concurrent.futures import ThreadPoolExecutor
     from . import storage
     from sqlalchemy import text
-
+    # ── TAMBAHKAN BLOK INI ──
+    # Jika token tidak ada, langsung lempar error agar skrip utama memicu auto-renew
+    if not is_available():
+        raise RuntimeError("BROKER_API_TOKEN not configured — add it to your .env")
+    # ── AKHIR BLOK ──
     start = _parse_date(start_date)
     end = _parse_date(end_date)
     if start > end:

@@ -210,3 +210,86 @@ def ingest_corporate_actions():
         print(f"[idx_api] ✅ Corporate Actions: {len(df)} baris disimpan.")
     else:
         print(f"[idx_api] ⚠️ Corporate Actions: Tidak ada data.")
+
+def ingest_company_details(ticker: str):
+    """Mengambil detail governance (Direksi, Komisaris, Pemegang Saham) untuk 1 saham."""
+    endpoint = "/ListedCompany/GetCompanyProfilesDetail"
+    params = {"KodeEmiten": ticker, "language": "id-id"}
+    
+    data = _fetch(endpoint, params=params)
+    
+    if not data or not data.get("Profiles") or len(data["Profiles"]) == 0:
+        print(f"[idx_api] ⚠️ Detail untuk {ticker} tidak ditemukan.")
+        return False
+        
+    profile = data["Profiles"][0]
+    
+    # 1. Pemegang Saham
+    shareholders = profile.get("PemegangSaham", [])
+    if shareholders:
+        sh_rows = []
+        for s in shareholders:
+            sh_rows.append({
+                "ticker": ticker,
+                "name": (s.get("Nama") or "").strip(),
+                "pct": float(s.get("Persentase") or 0.0),
+                "is_controlling": bool(s.get("Pengendali", False))
+            })
+        if sh_rows:
+            df_sh = pd.DataFrame(sh_rows)
+            storage.upsert_company_shareholders(df_sh)
+            
+    # 2. Direksi & Komisaris
+    board_rows = []
+    for d in profile.get("Direksi", []):
+        board_rows.append({
+            "ticker": ticker,
+            "name": (d.get("Nama") or "").strip(),
+            "role": "Director",
+            "title": (d.get("Jabatan") or "").strip()
+        })
+    for k in profile.get("DewanKomisaris", []):
+        board_rows.append({
+            "ticker": ticker,
+            "name": (k.get("Nama") or "").strip(),
+            "role": "Commissioner",
+            "title": (k.get("Jabatan") or "").strip()
+        })
+        
+    if board_rows:
+        df_b = pd.DataFrame(board_rows)
+        storage.upsert_company_board(df_b)
+        
+    return True
+
+
+def ingest_all_company_details(concurrency: int = 5):
+    """Mengambil detail governance untuk SEMUA saham di tabel tickers secara concurrent."""
+    from . import universe as universe_mod
+    import concurrent.futures
+    
+    tickers = universe_mod.get_master_tickers(active_only=True)
+    print(f"[idx_api] 🏢 Mengambil Company Details untuk {len(tickers)} saham (Concurrency: {concurrency})...")
+    
+    success_count = 0
+    fail_count = 0
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = {executor.submit(ingest_company_details, t): t for t in tickers}
+        
+        for i, future in enumerate(concurrent.futures.as_completed(futures), 1):
+            ticker = futures[future]
+            try:
+                result = future.result()
+                if result:
+                    success_count += 1
+                else:
+                    fail_count += 1
+            except Exception as exc:
+                print(f"[idx_api] ❌ Error fetching details for {ticker}: {exc}")
+                fail_count += 1
+                
+            if i % 50 == 0:
+                print(f"   - Progress: {i}/{len(tickers)} (Success: {success_count}, Fail: {fail_count})")
+                
+    print(f"[idx_api] ✅ Company Details selesai! Total Sukses: {success_count}, Gagal: {fail_count}")

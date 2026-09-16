@@ -16,17 +16,21 @@ _HEADERS = {
 }
 
 # ── SINKRONUS HELPER ──
-def _fetch(endpoint: str, params: dict = None, retries: int = 3) -> dict | None:
+def _fetch(endpoint: str, params: dict = None, retries: int = 5) -> dict | None:
     url = f"{_BASE}{endpoint}"
     for attempt in range(retries):
         try:
             resp = requests.get(url, params=params, headers=_HEADERS, impersonate="chrome", timeout=20)
             if resp.status_code == 200:
                 return resp.json()
-            elif resp.status_code in (429, 500, 502, 503, 504):
-                print(f"[idx_api] HTTP {resp.status_code} on {endpoint}. Retrying in {2**attempt}s...")
-                time.sleep(2 ** attempt)
+            elif resp.status_code == 429:
+                # Jeda lebih lama untuk 429: 5s, 10s, 20s, 40s, 80s
+                wait_time = 5 * (2 ** attempt)
+                print(f"[idx_api] ⚠️ HTTP 429 (Rate Limit). Menunggu {wait_time}s sebelum retry...")
+                time.sleep(wait_time)
+                continue
             else:
+                print(f"[idx_api] HTTP {resp.status_code} on {endpoint}")
                 return None
         except Exception as e:
             if attempt < retries - 1:
@@ -34,6 +38,7 @@ def _fetch(endpoint: str, params: dict = None, retries: int = 3) -> dict | None:
             else:
                 print(f"[idx_api] Error fetching {endpoint}: {e}")
                 return None
+    print(f"[idx_api] ❌ Gagal mengambil {endpoint} setelah {retries}x retry.")
     return None
 
 async def _async_fetch(session: requests.AsyncSession, endpoint: str, params: dict = None) -> dict | None:

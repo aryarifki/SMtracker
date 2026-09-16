@@ -216,7 +216,7 @@ def run_backfill_month(
     # Menggunakan concurrency=8, backfill 1 bulan hanya butuh ~2-3 menit.
     print("\n   🚀 [1/2] Mengambil data IDX (Harga & Broker Aggregate) via Async...")
     try:
-        idx_api.run_async_backfill(start, end, concurrency=8)
+        idx_api.run_async_backfill(start, end, concurrency=4)
     except Exception as e:
         print(f"   ❌ Gagal mengambil data IDX: {e}")
 

@@ -36,20 +36,35 @@ def _fetch(endpoint: str, params: dict = None, retries: int = 3) -> dict | None:
                 return None
     return None
 
-# ── ASINKRONUS HELPER ──
 async def _async_fetch(session: requests.AsyncSession, endpoint: str, params: dict = None) -> dict | None:
+    """Fetch data dari idx.co.id secara async dengan browser impersonation & retry 429."""
     url = f"{_BASE}{endpoint}"
-    try:
-        resp = await session.get(url, params=params, headers=_HEADERS, impersonate="chrome", timeout=20)
-        if resp.status_code == 200:
-            return resp.json()
-        else:
-            print(f"[idx_async] HTTP {resp.status_code} on {endpoint}")
+    max_retries = 3
+    
+    for attempt in range(max_retries):
+        try:
+            resp = await session.get(url, params=params, headers=_HEADERS, impersonate="chrome", timeout=20)
+            
+            # ── HANDLING RATE LIMIT (429) ──
+            if resp.status_code == 429:
+                wait_time = 2 ** attempt  # 2s, 4s, 8s
+                print(f"[idx_async] ⚠️ HTTP 429 (Rate Limit). Menunggu {wait_time}s sebelum retry...")
+                await asyncio.sleep(wait_time)
+                continue
+                
+            if resp.status_code == 200:
+                return resp.json()
+            else:
+                print(f"[idx_async] HTTP {resp.status_code} on {endpoint}")
+                return None
+                
+        except Exception as e:
+            print(f"[idx_async] Error fetching {endpoint}: {e}")
             return None
-    except Exception as e:
-        print(f"[idx_async] Error fetching {endpoint}: {e}")
-        return None
-
+            
+    print(f"[idx_async] ❌ Gagal mengambil {endpoint} setelah {max_retries}x retry.")
+    return None
+    
 # ── PARSER DATAframe ──
 def _parse_stock_data(data: dict, date_iso: str) -> pd.DataFrame:
     if not data or not data.get("data"): return pd.DataFrame()

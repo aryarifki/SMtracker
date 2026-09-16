@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Backfill broker data harian (dinamis N-hari ke belakang) dengan auto-token renew."""
+"""Backfill broker data harian (IDX Async + Stockbit Detail) dengan auto-token renew."""
 
 from __future__ import annotations
 import argparse
@@ -18,7 +18,7 @@ _SRC = _ROOT / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from idx_bandarmology import prices, storage, universe as universe_mod, broker_api
+from idx_bandarmology import storage, universe as universe_mod, broker_api, idx_api
 from idx_bandarmology.broker_api import set_rate_limit
 try:
     from idx_bandarmology import config
@@ -115,7 +115,7 @@ def auto_renew_token(force_clean_session: bool = False) -> bool:
     return False
 
 # --- LOGIKA EKSEKUSI HARIAN ---
-def run_daily_backfill(universe_mode: str, rate_limit: float, refresh_prices: bool, days_back: int) -> bool:
+def run_daily_backfill(universe_mode: str, rate_limit: float, days_back: int) -> bool:
     end = date.today()
     start = end - timedelta(days=days_back)
 
@@ -126,27 +126,34 @@ def run_daily_backfill(universe_mode: str, rate_limit: float, refresh_prices: bo
     syms = universe_mod.get_universe(universe_mode)
     print(f"   🎯 Target: {len(syms)} tickers di universe '{universe_mode}'")
 
+    # ── 1. AMBIL DATA IDX (SANGAT CEPAT, ~15 DETIK) ──
+    # Mengambil OHLCV, Broker Aggregate, dan Index langsung dari idx.co.id
+    # Data langsung masuk ke PostgreSQL, Investowl bisa langsung menampilkannya.
+    print("\n🚀 [1/2] Mengambil data IDX (Harga & Broker Aggregate)...")
+    current = start
+    while current <= end:
+        if current.weekday() < 5:  # Hanya hari kerja
+            try:
+                idx_api.ingest_idx_daily_data(current)
+            except Exception as e:
+                print(f"[daily] ❌ Gagal ambil data IDX untuk {current}: {e}")
+        current += timedelta(days=1)
+
+    # ── 2. AMBIL DATA STOCKBIT (BROKER-TO-BROKER DETAIL) ──
+    # Mengambil data distribusi broker dan sinyal bandar
+    print("\n📈 [2/2] Mengambil data Stockbit (Bandarmology)...")
     max_retries = 3
     for attempt in range(max_retries):
         try:
             t0 = time.monotonic()
             set_rate_limit(rate_limit)
 
-            # 1. Ambil data harga (IDX) jika diizinkan
-            n_prices = 0
-            if refresh_prices:
-                print("[daily] Menarik data harga dari IDX...")
-                n_prices = prices.fetch_history_many(syms, period="1y")
-                print(f"[daily]   -> {n_prices} baris harga tersimpan.")
-
-            # 2. Ambil data broker langsung ke endpoint history (Bypass watchlist)
-            print("[daily] Menarik data broker dari Stockbit...")
             n_broker, n_activity = broker_api.fetch_historical_broker_data(
-                syms, start, end, force=True # Force=True agar selalu eksekusi
+                syms, start, end, force=True # Force=True agar selalu eksekusi pengecekan
             )
 
             elapsed = time.monotonic() - t0
-            print(f"   ✅ Selesai dalam {elapsed/60:.1f} menit")
+            print(f"\n   ✅ Proses Stockbit selesai dalam {elapsed/60:.1f} menit")
             print(f"      📊 Broker rows: {n_broker:,} | Activity rows: {n_activity:,}")
             return True
 
@@ -169,11 +176,10 @@ def run_daily_backfill(universe_mode: str, rate_limit: float, refresh_prices: bo
     return False
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Backfill broker data harian")
+    parser = argparse.ArgumentParser(description="Backfill broker data harian (IDX + Stockbit)")
     parser.add_argument("--universe", default="watchlist", help="Universe yang akan ditarik")
     parser.add_argument("--days", type=int, default=3, help="Jumlah hari ke belakang")
     parser.add_argument("--rate-limit", type=float, default=8.0)
-    parser.add_argument("--no-refresh-prices", action="store_true")
     args = parser.parse_args()
     
     # ── SKIP WEEKEND UNTUK CRONJOB ──
@@ -183,7 +189,7 @@ def main() -> None:
         
     storage.init_db()
     
-    if not run_daily_backfill(args.universe, args.rate_limit, not args.no_refresh_prices, args.days):
+    if not run_daily_backfill(args.universe, args.rate_limit, args.days):
         print("\n🛑 CRONJOB GAGAL: Backfill harian tidak berhasil setelah 3x percobaan.")
         sys.exit(1)
 

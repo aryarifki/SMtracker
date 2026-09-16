@@ -1,7 +1,8 @@
-"""IDX API Client - Hybrid (Sync) dengan WAF Bypass (curl_cffi) & Rate Limiter."""
+"""IDX API Client - Super Safe Sequential Mode dengan WAF Bypass (curl_cffi)."""
 
 from __future__ import annotations
 import time
+import random
 from datetime import date, timedelta
 import pandas as pd
 from curl_cffi import requests
@@ -14,22 +15,23 @@ _HEADERS = {
     "Referer": "https://www.idx.co.id/",
 }
 
-# ── SINKRONUS HELPER ──
+# ── SINKRONUS HELPER (SUPER AMAN) ──
 def _fetch(endpoint: str, params: dict = None, retries: int = 5) -> dict | None:
     url = f"{_BASE}{endpoint}"
     for attempt in range(retries):
         try:
-            # Jeda wajib 2 detik sebelum setiap request ke IDX
-            time.sleep(2.0)
+            # Jeda acak 3 hingga 5 detik sebelum setiap request (meniru manusia)
+            sleep_time = random.uniform(3.0, 5.0)
+            time.sleep(sleep_time)
             
             resp = requests.get(url, params=params, headers=_HEADERS, impersonate="chrome", timeout=20)
             
             if resp.status_code == 200:
                 return resp.json()
             elif resp.status_code == 429:
-                # Jika kena 429, tidur 60 detik agar penalti IP dicabut
-                print(f"[idx_api] ⚠️ HTTP 429 (Rate Limit). IP terkena penalti. Menunggu 60s...")
-                time.sleep(60)
+                # Jika kena 429, tidur 120 detik (2 menit)
+                print(f"[idx_api] ⚠️ HTTP 429 (Rate Limit). IP terkena penalti. Menunggu 120s...")
+                time.sleep(120)
                 continue
             else:
                 print(f"[idx_api] HTTP {resp.status_code} on {endpoint}")
@@ -154,6 +156,10 @@ def ingest_corporate_actions():
         cols = ["date", "ticker", "ca_type", "description"]
         for c in cols:
             if c not in df.columns: df[c] = None
+        
+        # ── HAPUS DUPLIKAT DARI DATA MENTAH IDX ──
+        df = df.drop_duplicates(subset=cols, keep='last')
+        
         storage.upsert_corporate_actions(df[cols])
         print(f"[idx_api] ✅ Corporate Actions: {len(df)} baris disimpan.")
 
@@ -210,22 +216,25 @@ def ingest_company_details(ticker: str):
         
     return True
 
-def ingest_all_company_details(concurrency: int = 5):
-    import concurrent.futures
+def ingest_all_company_details():
+    """Mengambil data governance untuk semua saham secara SEQUENTIAL (Super Aman)."""
     from . import universe as universe_mod
     tickers = universe_mod.get_master_tickers(active_only=True)
-    print(f"[idx_api] 🏢 Mengambil Company Details untuk {len(tickers)} saham (Concurrency: {concurrency})...")
+    print(f"[idx_api] 🏢 Mengambil Company Details untuk {len(tickers)} saham (Sequential Mode)...")
     
     success_count = 0
     fail_count = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
-        futures = {executor.submit(ingest_company_details, t): t for t in tickers}
-        for i, future in enumerate(concurrent.futures.as_completed(futures), 1):
-            try:
-                if future.result(): success_count += 1
-                else: fail_count += 1
-            except Exception: fail_count += 1
-            if i % 50 == 0: print(f"   - Progress: {i}/{len(tickers)} (Success: {success_count}, Fail: {fail_count})")
     
-    # Perbaikan typo di baris terakhir (hapus tanda } yang berlebih)
+    for i, ticker in enumerate(tickers, 1):
+        try:
+            if ingest_company_details(ticker):
+                success_count += 1
+            else:
+                fail_count += 1
+        except Exception:
+            fail_count += 1
+            
+        if i % 50 == 0:
+            print(f"   - Progress: {i}/{len(tickers)} (Success: {success_count}, Fail: {fail_count})")
+    
     print(f"[idx_api] ✅ Company Details selesai! Total Sukses: {success_count}, Gagal: {fail_count}")

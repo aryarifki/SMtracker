@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Backfill broker data harian (IDX Async + Stockbit Detail) dengan auto-token renew."""
+"""Backfill broker data harian (IDX Sequential + Stockbit Detail) dengan auto-token renew."""
 
 from __future__ import annotations
 import argparse
@@ -126,13 +126,13 @@ def run_daily_backfill(universe_mode: str, rate_limit: float, days_back: int) ->
     syms = universe_mod.get_universe(universe_mode)
     print(f"   🎯 Target: {len(syms)} tickers di universe '{universe_mode}'")
 
-    # ── 1. AMBIL DATA IDX (SANGAT CEPAT, ~15 DETIK) ──
+    # ── 1. AMBIL DATA IDX (SEQUENTIAL, AMAN DARI 429) ──
     # Mengambil OHLCV, Broker Aggregate, dan Index langsung dari idx.co.id
-    # Data langsung masuk ke PostgreSQL, Investowl bisa langsung menampilkannya.
+    # Ditarik per-tanggal. Hanya butuh ~15 detik per hari.
     print("\n🚀 [1/2] Mengambil data IDX (Harga & Broker Aggregate)...")
     current = start
     while current <= end:
-        if current.weekday() < 5:  # Hanya hari kerja
+        if current.weekday() < 5:  # Hanya hari kerja (Senin-Jumat)
             try:
                 idx_api.ingest_idx_daily_data(current)
             except Exception as e:
@@ -182,11 +182,6 @@ def main() -> None:
     parser.add_argument("--rate-limit", type=float, default=8.0)
     args = parser.parse_args()
     
-    # ── SKIP WEEKEND UNTUK CRONJOB ──
-    if date.today().weekday() >= 5:
-        print("🗓️ Hari ini akhir pekan (Sabtu/Minggu). Bursa saham tutup. Skrip dihentikan.")
-        sys.exit(0)
-        
     storage.init_db()
     
     if not run_daily_backfill(args.universe, args.rate_limit, args.days):

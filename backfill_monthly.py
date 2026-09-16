@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Backfill broker data per bulan dengan progress tracking via PostgreSQL & auto-token renew."""
+"""Backfill broker data per bulan dengan async IDX (cepat) + Stockbit (detail) & auto-token renew."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ _SRC = _ROOT / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from idx_bandarmology import pipeline, storage, universe as universe_mod
+from idx_bandarmology import pipeline, storage, universe as universe_mod, idx_api
 from idx_bandarmology.broker_api import set_rate_limit
 try:
     from idx_bandarmology import config
@@ -166,22 +166,31 @@ def check_db_status(universe_mode: str) -> None:
     print(f"📋 Backfill Progress (Cek Database)\n   Universe: {universe_mode.upper()}")
     syms = universe_mod.get_universe(universe_mode)
     
-    q = text("""
-        SELECT 
-            MIN(date) as start_date, 
-            MAX(date) as end_date,
-            COUNT(DISTINCT date) as trading_days
-        FROM broker_flow 
-        WHERE ticker = ANY(:tickers)
+    q_broker = text("""
+        SELECT MIN(date) as start_date, MAX(date) as end_date, COUNT(DISTINCT date) as trading_days
+        FROM broker_flow WHERE ticker = ANY(:tickers)
     """)
+    
+    q_prices = text("""
+        SELECT MIN(date) as start_date, MAX(date) as end_date, COUNT(DISTINCT date) as trading_days
+        FROM prices WHERE ticker = ANY(:tickers)
+    """)
+    
     with storage.engine.connect() as conn:
-        result = conn.execute(q, {"tickers": syms}).fetchone()
+        res_broker = conn.execute(q_broker, {"tickers": syms}).fetchone()
+        res_prices = conn.execute(q_prices, {"tickers": syms}).fetchone()
         
-    if result and result[2] > 0:
-        print(f"   📅 Data tercatat dari {result[0]} hingga {result[1]}")
-        print(f"   📊 Total hari kerja tersimpan di DB: {result[2]} hari")
+    print("-" * 40)
+    if res_prices and res_prices[2] > 0:
+        print(f"   📈 Data Harga (IDX): {res_prices[0]} hingga {res_prices[1]} ({res_prices[2]} hari)")
     else:
-        print("   ❌ Belum ada data tersimpan untuk universe ini.")
+        print("   ❌ Belum ada data Harga (IDX) tersimpan.")
+        
+    if res_broker and res_broker[2] > 0:
+        print(f"   📊 Data Bandar (Stockbit): {res_broker[0]} hingga {res_broker[1]} ({res_broker[2]} hari)")
+    else:
+        print("   ❌ Belum ada data Bandar (Stockbit) tersimpan.")
+    print("-" * 40)
 
 # ── eksekusi utama ─────────────────────────────────────────────────────────
 def run_backfill_month(
@@ -200,29 +209,42 @@ def run_backfill_month(
     
     n_days = (end - start).days + 1
     trading_days = sum(1 for i in range(n_days) if (start + timedelta(days=i)).weekday() < 5)
-    print(f"   🎯 Target: {len(syms)} tickers | Hari kerja: ~{trading_days} | Estimasi (jika dari nol): {estimate_time(len(syms), trading_days)}")
+    print(f"   🎯 Target: {len(syms)} tickers | Hari kerja: ~{trading_days} | Estimasi Stockbit (jika dari nol): {estimate_time(len(syms), trading_days)}")
 
+    # ── 1. AMBIL DATA IDX (ASYNC, SANGAT CEPAT) ──
+    # Data harga (OHLCV), Broker Aggregate, dan Index langsung dari idx.co.id
+    # Menggunakan concurrency=8, backfill 1 bulan hanya butuh ~2-3 menit.
+    print("\n   🚀 [1/2] Mengambil data IDX (Harga & Broker Aggregate) via Async...")
+    try:
+        idx_api.run_async_backfill(start, end, concurrency=8)
+    except Exception as e:
+        print(f"   ❌ Gagal mengambil data IDX: {e}")
+
+    # ── 2. AMBIL DATA STOCKBIT (BROKER-TO-BROKER) ──
+    # Data detail distribusi broker dan sinyal bandar
+    print("\n   📈 [2/2] Mengambil data Stockbit (Bandarmology)...")
     max_retries = 3
     for attempt in range(max_retries):
         try:
             t0 = time.monotonic()
             set_rate_limit(rate_limit)
 
-            # Memanggil pipeline (broker_api akan otomatis cek DB & skip yang sudah ada)
+            # Karena data harga sudah diambil oleh idx_api, kita set refresh_prices=False
+            # agar pipeline tidak menarik ulang data harga menggunakan metode lama.
             result = pipeline.backfill_broker_history(
                 universe_mode=universe_mode, 
                 start_date=start,
                 end_date=end,
-                refresh_prices=refresh_prices,
+                refresh_prices=False, 
                 price_period="1y",
             )
 
             elapsed = time.monotonic() - t0
-            print(f"   ✅ Proses selesai dalam {elapsed/60:.1f} menit")
+            print(f"\n   ✅ Proses Stockbit selesai dalam {elapsed/60:.1f} menit")
             print(f"      📊 Baris baru disimpan -> Broker rows: {result['n_broker']:,} | Activity rows: {result.get('n_activity', 0):,}")
 
             if result['n_broker'] == 0 and result['n_activity'] == 0:
-                print("   ℹ️ Tidak ada baris baru yang diambil (kemungkinan data bulan ini sudah lengkap di database).")
+                print("   ℹ️ Tidak ada baris baru Stockbit (kemungkinan data bulan ini sudah lengkap di database).")
             
             return True
 
@@ -245,12 +267,12 @@ def run_backfill_month(
     return False
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Backfill broker data per bulan (100% DB Sync)")
+    parser = argparse.ArgumentParser(description="Backfill broker data per bulan (Hybrid IDX Async + Stockbit)")
     parser.add_argument("--universe", default="idx80", help="Universe yang akan di-backfill")
     parser.add_argument("--months", default="all", help='Bulan: "all", "last3", "2026-09", dll.')
     parser.add_argument("--rate-limit", type=float, default=8.0)
-    parser.add_argument("--no-refresh-prices", action="store_true")
     parser.add_argument("--status", action="store_true", help="Cek tanggal maksimal data di database")
+    # --no-refresh-prices tidak lagi diperlukan karena idx_api menangani harga secara async
     
     args = parser.parse_args()
     
@@ -277,7 +299,7 @@ def main() -> None:
         return
 
     for start, end, label in selected:
-        ok = run_backfill_month(label, start, end, args.universe, args.rate_limit, not args.no_refresh_prices)
+        ok = run_backfill_month(label, start, end, args.universe, args.rate_limit, False)
         if label != selected[-1][2] and ok:
             print(f"⏸️ Jeda {_PAUSE_BETWEEN_MONTHS} detik sebelum bulan berikutnya...")
             time.sleep(_PAUSE_BETWEEN_MONTHS)

@@ -156,6 +156,22 @@ CREATE INDEX IF NOT EXISTS idx_idx_broker_date ON idx_broker_summary(date);
 CREATE INDEX IF NOT EXISTS idx_idx_index_date ON idx_index_summary(date);
 """
 
+-- ── Governance Tables ──
+CREATE TABLE IF NOT EXISTS company_shareholders (
+    ticker VARCHAR(20) NOT NULL,
+    name VARCHAR(200) NOT NULL,
+    pct NUMERIC,
+    is_controlling BOOLEAN DEFAULT FALSE,
+    PRIMARY KEY (ticker, name)
+);
+
+CREATE TABLE IF NOT EXISTS company_board (
+    ticker VARCHAR(20) NOT NULL,
+    name VARCHAR(200) NOT NULL,
+    role VARCHAR(50),
+    title VARCHAR(100),
+    PRIMARY KEY (ticker, name, role, title)
+);
 
 def init_db() -> None:
     """Create tables and indexes if they don't exist yet."""
@@ -637,6 +653,65 @@ def read_corporate_actions(
     with engine.connect() as conn:
         return pd.read_sql(text(q), conn, params=params, parse_dates=["date"])
 
+def upsert_company_shareholders(df: pd.DataFrame) -> int:
+    if df.empty:
+        return 0
+    df = _clean_numeric_df(df)
+    cols = ["ticker", "name", "pct", "is_controlling"]
+    for c in cols:
+        if c not in df.columns:
+            df[c] = None
+    rows = [tuple(row) for row in df[cols].values]
+
+    raw_conn = _get_raw_conn()
+    try:
+        with raw_conn.cursor() as cur:
+            execute_values(
+                cur,
+                """
+                INSERT INTO company_shareholders (ticker, name, pct, is_controlling)
+                VALUES %s
+                ON CONFLICT (ticker, name) DO UPDATE SET
+                    pct = EXCLUDED.pct,
+                    is_controlling = EXCLUDED.is_controlling
+                """,
+                rows,
+                page_size=2000,
+            )
+        raw_conn.commit()
+    finally:
+        raw_conn.close()
+    return len(df)
+
+
+def upsert_company_board(df: pd.DataFrame) -> int:
+    if df.empty:
+        return 0
+    df = _clean_numeric_df(df)
+    cols = ["ticker", "name", "role", "title"]
+    for c in cols:
+        if c not in df.columns:
+            df[c] = None
+    rows = [tuple(row) for row in df[cols].values]
+
+    raw_conn = _get_raw_conn()
+    try:
+        with raw_conn.cursor() as cur:
+            execute_values(
+                cur,
+                """
+                INSERT INTO company_board (ticker, name, role, title)
+                VALUES %s
+                ON CONFLICT (ticker, name, role, title) DO UPDATE SET
+                    title = EXCLUDED.title
+                """,
+                rows,
+                page_size=2000,
+            )
+        raw_conn.commit()
+    finally:
+        raw_conn.close()
+    return len(df)
 
 def read_runs() -> pd.DataFrame:
     init_db()

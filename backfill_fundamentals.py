@@ -17,6 +17,9 @@ def main():
     parser.add_argument("--details", action="store_true", help="Ambil Company Details (Direksi, Komisaris, Pemegang Saham)")
     parser.add_argument("--ratios", action="store_true", help="Ambil Financial Ratios")
     parser.add_argument("--actions", action="store_true", help="Ambil Corporate Actions")
+    parser.add_argument("--year", type=int, default=2024, help="Tahun laporan keuangan (default: 2024)")
+    parser.add_argument("--quarter", type=int, default=4, help="Kuartal laporan keuangan (default: 4)")
+    parser.add_argument("--all-years", action="store_true", help="Ambil Financial Ratios untuk 2022, 2023, 2024 (Q4)")
     parser.add_argument("--concurrency", type=int, default=5, help="Jumlah concurrent request untuk details")
     
     args = parser.parse_args()
@@ -30,11 +33,19 @@ def main():
         idx_api.ingest_all_company_details(concurrency=args.concurrency)
         
     if args.ratios:
-        print("=" * 60)
-        print("📊 Mengambil Financial Ratios...")
-        print("=" * 60)
-        # Ambil data tahun 2024 kuartal 4 (sesuaikan jika perlu)
-        idx_api.ingest_financial_ratios(year=2024, quarter=4)
+        if args.all_years:
+            # Ambil data fundamental 3 tahun terakhir untuk backtesting
+            years_to_fetch = [2022, 2023, 2024]
+            for y in years_to_fetch:
+                print("=" * 60)
+                print(f"📊 Mengambil Financial Ratios (Year: {y}, Quarter: 4)...")
+                print("=" * 60)
+                idx_api.ingest_financial_ratios(year=y, quarter=4)
+        else:
+            print("=" * 60)
+            print(f"📊 Mengambil Financial Ratios (Year: {args.year}, Quarter: {args.quarter})...")
+            print("=" * 60)
+            idx_api.ingest_financial_ratios(year=args.year, quarter=args.quarter)
         
     if args.actions:
         print("=" * 60)
@@ -42,10 +53,24 @@ def main():
         print("=" * 60)
         idx_api.ingest_corporate_actions()
         
+    # Jika tidak ada argumen spesifik, jalankan semuanya
     if not (args.details or args.ratios or args.actions):
         print("Tidak ada argumen yang diberikan. Mengambil SEMUA data fundamental...")
+        print("=" * 60)
+        print("🏢 Mengambil Company Details (Governance)...")
+        print("=" * 60)
         idx_api.ingest_all_company_details(concurrency=args.concurrency)
-        idx_api.ingest_financial_ratios(year=2024, quarter=4)
+        
+        years_to_fetch = [2022, 2023, 2024]
+        for y in years_to_fetch:
+            print("=" * 60)
+            print(f"📊 Mengambil Financial Ratios (Year: {y}, Quarter: 4)...")
+            print("=" * 60)
+            idx_api.ingest_financial_ratios(year=y, quarter=4)
+            
+        print("=" * 60)
+        print("📝 Mengambil Corporate Actions...")
+        print("=" * 60)
         idx_api.ingest_corporate_actions()
 
 if __name__ == "__main__":

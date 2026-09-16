@@ -1,9 +1,4 @@
-"""PostgreSQL storage — SQLAlchemy edition (Optimized, Indexed & IDX Integrated).
-
-Replaces raw psycopg2 connections with SQLAlchemy engine for full pandas
-compatibility while keeping bulk-upsert performance via raw psycopg2 
-connections from the SQLAlchemy pool with explicit date-filtering.
-"""
+"""PostgreSQL storage — SQLAlchemy edition (Optimized, Indexed & IDX Integrated)."""
 
 from __future__ import annotations
 
@@ -26,125 +21,6 @@ engine = create_engine(
     pool_recycle=1800,
 )
 
-# ── schema ───────────────────────────────────────────────────────────────────
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS prices (
-    date    DATE NOT NULL,
-    ticker  VARCHAR(20) NOT NULL,
-    open    NUMERIC,
-    high    NUMERIC,
-    low     NUMERIC,
-    close   NUMERIC,
-    volume  BIGINT,
-    PRIMARY KEY (date, ticker)
-);
-
--- Alter existing prices table for IDX OHLCV + Foreign Flow + Pasar Nego
-ALTER TABLE prices ADD COLUMN IF NOT EXISTS foreign_buy BIGINT;
-ALTER TABLE prices ADD COLUMN IF NOT EXISTS foreign_sell BIGINT;
-ALTER TABLE prices ADD COLUMN IF NOT EXISTS value BIGINT;
-ALTER TABLE prices ADD COLUMN IF NOT EXISTS frequency INTEGER;
-ALTER TABLE prices ADD COLUMN IF NOT EXISTS non_regular_volume BIGINT;
-ALTER TABLE prices ADD COLUMN IF NOT EXISTS non_regular_value BIGINT;
-
-CREATE TABLE IF NOT EXISTS broker_flow (
-    date                DATE NOT NULL,
-    ticker              VARCHAR(20) NOT NULL,
-    bandar_signal       VARCHAR(50),
-    bandar_signal_score NUMERIC,
-    foreign_net_broker  NUMERIC,
-    local_net_broker    NUMERIC,
-    gov_net_broker      NUMERIC,
-    foreign_net_flow    NUMERIC,
-    domestic_net_flow   NUMERIC,
-    total_value         NUMERIC,
-    foreign_signal      VARCHAR(50),
-    conclusion_broker   TEXT,
-    conclusion_flow     TEXT,
-    fetched_at          TIMESTAMP,
-    PRIMARY KEY (date, ticker)
-);
-
-CREATE TABLE IF NOT EXISTS broker_activity (
-    date             DATE NOT NULL,
-    ticker           VARCHAR(20) NOT NULL,
-    broker_code      VARCHAR(20) NOT NULL,
-    participant_type VARCHAR(20),
-    buy_value        NUMERIC,
-    sell_value       NUMERIC,
-    net_value        NUMERIC,
-    buy_lot          NUMERIC,
-    sell_lot         NUMERIC,
-    frequency        NUMERIC,
-    buy_avg_price    NUMERIC,
-    sell_avg_price   NUMERIC,
-    fetched_at       TIMESTAMP,
-    PRIMARY KEY (date, ticker, broker_code)
-);
-
-CREATE TABLE IF NOT EXISTS runs (
-    run_at   TIMESTAMP NOT NULL,
-    tickers  TEXT,
-    n_prices INTEGER,
-    n_broker INTEGER,
-    notes    TEXT
-);
-
-CREATE TABLE IF NOT EXISTS tickers (
-    ticker      VARCHAR(20) PRIMARY KEY,
-    name        VARCHAR(200),
-    board       VARCHAR(50),
-    sector      VARCHAR(100),
-    is_active   BOOLEAN DEFAULT TRUE,
-    updated_at  TIMESTAMP
-);
-
--- ── IDX Direct API Tables ──
-CREATE TABLE IF NOT EXISTS idx_broker_summary (
-    date DATE NOT NULL,
-    id_firm VARCHAR(20) NOT NULL,
-    firm_name VARCHAR(200),
-    volume BIGINT,
-    value BIGINT,
-    frequency INTEGER,
-    PRIMARY KEY (date, id_firm)
-);
-
-CREATE TABLE IF NOT EXISTS idx_index_summary (
-    date DATE NOT NULL,
-    index_code VARCHAR(20) NOT NULL,
-    index_name VARCHAR(100),
-    close NUMERIC,
-    volume BIGINT,
-    value BIGINT,
-    market_cap NUMERIC,
-    PRIMARY KEY (date, index_code)
-);
-
-CREATE TABLE IF NOT EXISTS financial_ratios (
-    code VARCHAR(20) NOT NULL,
-    year INT NOT NULL,
-    quarter INT NOT NULL,
-    per NUMERIC,
-    pbv NUMERIC,
-    roe NUMERIC,
-    roa NUMERIC,
-    der NUMERIC,
-    eps NUMERIC,
-    PRIMARY KEY (code, year, quarter)
-);
-
-CREATE TABLE IF NOT EXISTS corporate_actions (
-    date DATE NOT NULL,
-    ticker VARCHAR(20) NOT NULL,
-    ca_type VARCHAR(50) NOT NULL,
-    description TEXT,
-    PRIMARY KEY (date, ticker, ca_type)
-);
-
--- Indeks komposit dan indeks tanggal tunggal untuk akselerasi query
-CREATE INDEX IF NOT EXISTS idx_prices_ticker_date ON prices(ticker, date);
-CREATE INDEX IF NOT EXISTS idx_prices_date ON prices(date);
 # ── schema ───────────────────────────────────────────────────────────────────
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS prices (
@@ -290,6 +166,8 @@ CREATE INDEX IF NOT EXISTS idx_tickers_sector ON tickers(sector);
 CREATE INDEX IF NOT EXISTS idx_tickers_board ON tickers(board);
 CREATE INDEX IF NOT EXISTS idx_idx_broker_date ON idx_broker_summary(date);
 CREATE INDEX IF NOT EXISTS idx_idx_index_date ON idx_index_summary(date);
+"""
+
 
 def init_db() -> None:
     """Create tables and indexes if they don't exist yet."""
@@ -323,7 +201,6 @@ def upsert_prices(df: pd.DataFrame) -> int:
     df = _clean_numeric_df(df)
     df["date"] = pd.to_datetime(df["date"]).dt.date.astype(str)
     
-    # Added new IDX columns
     cols = [
         "date", "ticker", "open", "high", "low", "close", "volume", 
         "foreign_buy", "foreign_sell", "value", "frequency", 
@@ -606,6 +483,67 @@ def upsert_corporate_actions(df: pd.DataFrame) -> int:
     return len(df)
 
 
+def upsert_company_shareholders(df: pd.DataFrame) -> int:
+    if df.empty:
+        return 0
+    df = _clean_numeric_df(df)
+    cols = ["ticker", "name", "pct", "is_controlling"]
+    for c in cols:
+        if c not in df.columns:
+            df[c] = None
+    rows = [tuple(row) for row in df[cols].values]
+
+    raw_conn = _get_raw_conn()
+    try:
+        with raw_conn.cursor() as cur:
+            execute_values(
+                cur,
+                """
+                INSERT INTO company_shareholders (ticker, name, pct, is_controlling)
+                VALUES %s
+                ON CONFLICT (ticker, name) DO UPDATE SET
+                    pct = EXCLUDED.pct,
+                    is_controlling = EXCLUDED.is_controlling
+                """,
+                rows,
+                page_size=2000,
+            )
+        raw_conn.commit()
+    finally:
+        raw_conn.close()
+    return len(df)
+
+
+def upsert_company_board(df: pd.DataFrame) -> int:
+    if df.empty:
+        return 0
+    df = _clean_numeric_df(df)
+    cols = ["ticker", "name", "role", "title"]
+    for c in cols:
+        if c not in df.columns:
+            df[c] = None
+    rows = [tuple(row) for row in df[cols].values]
+
+    raw_conn = _get_raw_conn()
+    try:
+        with raw_conn.cursor() as cur:
+            execute_values(
+                cur,
+                """
+                INSERT INTO company_board (ticker, name, role, title)
+                VALUES %s
+                ON CONFLICT (ticker, name, role, title) DO UPDATE SET
+                    title = EXCLUDED.title
+                """,
+                rows,
+                page_size=2000,
+            )
+        raw_conn.commit()
+    finally:
+        raw_conn.close()
+    return len(df)
+
+
 def log_run(tickers: list[str], n_prices: int, n_broker: int, notes: str = "") -> None:
     init_db()
     with engine.begin() as conn:
@@ -771,65 +709,6 @@ def read_corporate_actions(
     with engine.connect() as conn:
         return pd.read_sql(text(q), conn, params=params, parse_dates=["date"])
 
-def upsert_company_shareholders(df: pd.DataFrame) -> int:
-    if df.empty:
-        return 0
-    df = _clean_numeric_df(df)
-    cols = ["ticker", "name", "pct", "is_controlling"]
-    for c in cols:
-        if c not in df.columns:
-            df[c] = None
-    rows = [tuple(row) for row in df[cols].values]
-
-    raw_conn = _get_raw_conn()
-    try:
-        with raw_conn.cursor() as cur:
-            execute_values(
-                cur,
-                """
-                INSERT INTO company_shareholders (ticker, name, pct, is_controlling)
-                VALUES %s
-                ON CONFLICT (ticker, name) DO UPDATE SET
-                    pct = EXCLUDED.pct,
-                    is_controlling = EXCLUDED.is_controlling
-                """,
-                rows,
-                page_size=2000,
-            )
-        raw_conn.commit()
-    finally:
-        raw_conn.close()
-    return len(df)
-
-
-def upsert_company_board(df: pd.DataFrame) -> int:
-    if df.empty:
-        return 0
-    df = _clean_numeric_df(df)
-    cols = ["ticker", "name", "role", "title"]
-    for c in cols:
-        if c not in df.columns:
-            df[c] = None
-    rows = [tuple(row) for row in df[cols].values]
-
-    raw_conn = _get_raw_conn()
-    try:
-        with raw_conn.cursor() as cur:
-            execute_values(
-                cur,
-                """
-                INSERT INTO company_board (ticker, name, role, title)
-                VALUES %s
-                ON CONFLICT (ticker, name, role, title) DO UPDATE SET
-                    title = EXCLUDED.title
-                """,
-                rows,
-                page_size=2000,
-            )
-        raw_conn.commit()
-    finally:
-        raw_conn.close()
-    return len(df)
 
 def read_runs() -> pd.DataFrame:
     init_db()

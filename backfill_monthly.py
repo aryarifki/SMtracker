@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Backfill broker data per bulan dengan async IDX (cepat) + Stockbit (detail) & auto-token renew."""
+"""Backfill broker data per bulan dengan IDX (Sequential, Aman dari 429) + Stockbit (Detail) & auto-token renew."""
 
 from __future__ import annotations
 
@@ -211,14 +211,18 @@ def run_backfill_month(
     trading_days = sum(1 for i in range(n_days) if (start + timedelta(days=i)).weekday() < 5)
     print(f"   🎯 Target: {len(syms)} tickers | Hari kerja: ~{trading_days} | Estimasi Stockbit (jika dari nol): {estimate_time(len(syms), trading_days)}")
 
-    # ── 1. AMBIL DATA IDX (ASYNC, SANGAT CEPAT) ──
+    # ── 1. AMBIL DATA IDX (SEQUENTIAL, SANGAT CEPAT & AMAN DARI 429) ──
     # Data harga (OHLCV), Broker Aggregate, dan Index langsung dari idx.co.id
-    # Menggunakan concurrency=8, backfill 1 bulan hanya butuh ~2-3 menit.
-    print("\n   🚀 [1/2] Mengambil data IDX (Harga & Broker Aggregate) via Async...")
-    try:
-        idx_api.run_async_backfill(start, end, concurrency=4)
-    except Exception as e:
-        print(f"   ❌ Gagal mengambil data IDX: {e}")
+    # Ditarik per-tanggal. 1 bulan (22 hari) hanya butuh ~1-2 menit.
+    print("\n   🚀 [1/2] Mengambil data IDX (Harga & Broker Aggregate)...")
+    current = start
+    while current <= end:
+        if current.weekday() < 5:  # Hanya hari kerja
+            try:
+                idx_api.ingest_idx_daily_data(current)
+            except Exception as e:
+                print(f"   ❌ Gagal ambil data IDX untuk {current}: {e}")
+        current += timedelta(days=1)
 
     # ── 2. AMBIL DATA STOCKBIT (BROKER-TO-BROKER) ──
     # Data detail distribusi broker dan sinyal bandar
@@ -267,12 +271,11 @@ def run_backfill_month(
     return False
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Backfill broker data per bulan (Hybrid IDX Async + Stockbit)")
+    parser = argparse.ArgumentParser(description="Backfill broker data per bulan (Hybrid IDX Sequential + Stockbit)")
     parser.add_argument("--universe", default="idx80", help="Universe yang akan di-backfill")
     parser.add_argument("--months", default="all", help='Bulan: "all", "last3", "2026-09", dll.')
     parser.add_argument("--rate-limit", type=float, default=8.0)
     parser.add_argument("--status", action="store_true", help="Cek tanggal maksimal data di database")
-    # --no-refresh-prices tidak lagi diperlukan karena idx_api menangani harga secara async
     
     args = parser.parse_args()
     

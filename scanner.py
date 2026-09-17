@@ -34,6 +34,7 @@ warnings.filterwarnings("ignore")
 MIN_SCORE_TO_SIGNAL = getattr(config, "MIN_SCORE_TO_SIGNAL", 65)
 MIN_PRICE_IDR = getattr(config, "MIN_PRICE_IDR", 50)
 MIN_VOLUME_LOT = getattr(config, "MIN_VOLUME_LOT", 10000)
+MIN_TURNOVER_IDR = 500_000_000  # Minimal nilai transaksi harian Rp 500 Juta
 
 # ── MAPPING NAMA SEKTOR (DB) KE KODE INDEX (DB) ──
 SECTOR_INDEX_MAP = {
@@ -287,6 +288,22 @@ def detect_vcp_grade(df) -> str:
     elif above and (contracting or vol_dry) and tscore >= 1: return "C"
     return "NONE"
 
+def is_goreng_pump(df, pump_thresh: float = 15.0, vol_thresh: float = 5.0) -> tuple:
+    """Deteksi saham gorengan yang naik terlalu cepat dalam 3 hari."""
+    if df is None or len(df) < 5: return False, ""
+    lp = float(df["close"].iloc[-1])
+    p3ago = float(df["close"].iloc[-min(4, len(df)-1)])
+    ret3 = (lp - p3ago) / p3ago * 100
+    vol = df["volume"]
+    vol_ma = float(vol.rolling(20).mean().iloc[-1]) if len(df) >= 20 else float(vol.mean())
+    vr = float(vol.iloc[-1]) / (vol_ma + 1)
+    
+    if ret3 > pump_thresh and vr > 2.5:
+        return True, f"Pump: +{ret3:.1f}% dalam 3 hari, volume {vr:.1f}x"
+    if vr > vol_thresh:
+        return True, f"Volume spike ekstrem {vr:.1f}x tanpa fundamental"
+    return False, ""
+    
 # ══════════════════════════════════════════════════════
 #  SCORING ENGINE
 # ══════════════════════════════════════════════════════
@@ -493,8 +510,25 @@ def _scan_tickers(tickers, session, ihsg_df, regime, threshold, ticker_sector_ma
         try:
             df = load_price_from_db(tk)
             if df is None: continue
+            
             lp = float(df["close"].iloc[-1])
-            if lp < MIN_PRICE_IDR or float(df["volume"].iloc[-1]) < MIN_VOLUME_LOT: continue
+            vol_today = float(df["volume"].iloc[-1])
+            
+            # Filter Likuiditas (Minimal Harga & Volume)
+            if lp < MIN_PRICE_IDR or vol_today < MIN_VOLUME_LOT: continue
+                
+            # Filter Nilai Transaksi (Turnover)
+            # Karena volume sudah dinormalisasi ke lot, turnover = harga * volume * 100 (1 lot = 100 lembar)
+            turnover = lp * vol_today * 100
+            if turnover < MIN_TURNOVER_IDR: continue
+
+            # Filter Gorengan / Pump and Dump
+            is_pump, pump_reason = is_goreng_pump(df)
+            if is_pump:
+                # Jika terdeteksi gorengan, masuk daftar hitam tapi skornya 0
+                r = {"ticker": tk, "score": 0, "signal_type": "BLOCKED", "reason": pump_reason}
+                all_calculated.append(r)
+                continue
 
             r = compute_signal_v1(df, tk, ihsg_df, regime, ticker_sector_map, sector_indices)
             if r is None: continue

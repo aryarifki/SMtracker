@@ -435,8 +435,10 @@ def compute_score_v4(df, ticker: str, ihsg_df, regime: dict) -> dict:
 # ══════════════════════════════════════════════════════
 
 def save_analytics_to_db(candidates):
+    """Menyimpan seluruh kalkulasi hari ini ke tabel analytics_daily_signals."""
     if not candidates: return
     
+    # Buat tabel jika belum ada
     with storage.engine.begin() as conn:
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS analytics_daily_signals (
@@ -460,7 +462,13 @@ def save_analytics_to_db(candidates):
             today = datetime.now().strftime("%Y-%m-%d")
 
             for c in candidates:
-                base_prob = float(c['score']) * 0.60 + float(c['sm_score']) * 0.40
+                # Ambil skor dengan default 0/50 jika saham tersebut diblokir (tidak punya data lengkap)
+                comp_score = c.get('score', 0)
+                sm_score = c.get('sm_score', 50)
+                ts_score = c.get('ts', 50)
+                fund_pen = c.get('fund_penalty', 0)
+                
+                base_prob = float(comp_score) * 0.60 + float(sm_score) * 0.40
                 ml_win_prob = min(99.0, max(1.0, base_prob))
 
                 if ml_win_prob >= 65: ml_label = "WIN"
@@ -491,9 +499,9 @@ def save_analytics_to_db(candidates):
                     updated_at = CURRENT_TIMESTAMP;
                 """
                 cur.execute(query, (
-                    today, c['ticker'], ml_win_prob, c['score'], 
-                    c.get('ts', 50), c.get('sm_score', 50), 
-                    100 - c.get('fund_penalty', 0), ml_label, json.dumps(features)
+                    today, c['ticker'], ml_win_prob, comp_score, 
+                    ts_score, sm_score, 
+                    100 - fund_pen, ml_label, json.dumps(features)
                 ))
 
             raw_conn.commit()
@@ -502,7 +510,7 @@ def save_analytics_to_db(candidates):
         print(f"\n  ❌ [DB Error] Gagal menyimpan analitik: {e}")
     finally:
         raw_conn.close()
-
+        
 # ══════════════════════════════════════════════════════
 #  MAIN SCAN EXECUTION
 # ══════════════════════════════════════════════════════

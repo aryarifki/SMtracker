@@ -83,6 +83,8 @@ def load_ihsg_from_db(days: int = 365) -> pd.DataFrame | None:
         if raw is not None and not raw.empty:
             if isinstance(raw.columns, pd.MultiIndex):
                 raw.columns = raw.columns.get_level_values(0)
+            # Reset index agar 'Date' menjadi kolom biasa
+            raw = raw.reset_index()
             df_yf = raw.rename(columns={"Date": "date", "Close": "close"})[["date", "close"]].dropna()
             if len(df_yf) >= 50:
                 return df_yf

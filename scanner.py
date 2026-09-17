@@ -1,3 +1,14 @@
+"""
+BandarAI Signal Scanner v5.0 — DB Native, Smart Money & Sector Rotation
+======================================================================
+Perubahan utama dari v4.0:
+- SECTOR ROTATION: Mengecek tren index sektoral (IDXENERGY, IDXFINANCE, dll).
+  Jika sektor sedang Bullish, skor naik. Jika Bearish, skor turun.
+- FULL DB INTEGRATION: Harga, Fundamental, & Sektor diambil dari PostgreSQL.
+- SCAN SEMUA SAHAM: Universe 'all' otomatis di-scan.
+- SMART MONEY SCORING: Membaca tabel broker_flow & analytics_foreign_flow.
+"""
+
 import os
 import sys
 import json
@@ -28,168 +39,172 @@ TICKER_BLACKLIST = {"TLKM", "ICBP", "BREN", "MIKA", "KLBF"}
 TICKER_PENALTY = {"BSDE": -8, "CTRA": -8, "ASII": -6, "SMRA": -8, "AKRA": -8, "MYOR": -8}
 TICKER_BONUS = {"MDKA": +8, "ADRO": +5, "PTBA": +3, "ULTJ": +3}
 
+# ── MAPPING NAMA SEKTOR (DB) KE KODE INDEX (DB) ──
+# Ini memetakan kolom 'sector' di tabel tickers ke kolom 'index_code' di idx_index_summary
+SECTOR_INDEX_MAP = {
+    "ENERGI": "IDXENERGY",
+    "ENERGY": "IDXENERGY",
+    "BARANG BAKU": "IDXBASIC",
+    "BASIC MATERIALS": "IDXBASIC",
+    "KEUANGAN": "IDXFINANCE",
+    "FINANCIALS": "IDXFINANCE",
+    "KESEHATAN": "IDXHEALTH",
+    "HEALTH CARE": "IDXHEALTH",
+    "INDUSTRI": "IDXINDUST",
+    "INDUSTRIALS": "IDXINDUST",
+    "PROPERTI": "IDXPROPERT",
+    "REAL ESTATE": "IDXPROPERT",
+    "INFRASTRUKTUR": "IDXINFRA",
+    "INFRASTRUCTURE": "IDXINFRA",
+    "TRANSPORTASI": "IDXTRANS",
+    "TRANSPORTATION": "IDXTRANS",
+    "TEKNOLOGI": "IDXTECHNO",
+    "TECHNOLOGY": "IDXTECHNO"
+}
+
 # ══════════════════════════════════════════════════════
-#  DB LOADERS (Menggantikan yfinance)
+#  DB LOADERS
 # ══════════════════════════════════════════════════════
 
 def load_price_from_db(ticker: str, days: int = 365) -> pd.DataFrame | None:
-    """Ambil data OHLCV historis dari tabel prices di PostgreSQL."""
     try:
         end_date = datetime.now().date()
         start_date = end_date - timedelta(days=days)
         df = storage.read_prices(tickers=[ticker], start_date=start_date, end_date=end_date)
-        
-        if df is None or df.empty or len(df) < 20:
-            return None
-            
-        df = df.rename(columns={
-            "open": "open", "high": "high", "low": "low",
-            "close": "close", "volume": "volume"
-        })
+        if df is None or df.empty or len(df) < 20: return None
+        df = df.rename(columns={"open": "open", "high": "high", "low": "low", "close": "close", "volume": "volume"})
         df = df[["date", "open", "high", "low", "close", "volume"]].dropna()
         df = df.sort_values("date").reset_index(drop=True)
-        
-        # Normalize volume ke lot jika ternyata dalam bentuk shares
-        if df["volume"].median() > 5e8:
-            df["volume"] = df["volume"] / 100
-            
+        if df["volume"].median() > 5e8: df["volume"] = df["volume"] / 100
         return df
-    except Exception:
-        return None
+    except Exception: return None
 
 def load_ihsg_from_db(days: int = 365) -> pd.DataFrame | None:
-    """Ambil data IHSG dari tabel idx_index_summary. Fallback ke yfinance jika data < 50 hari."""
     try:
         end_date = datetime.now().date()
         start_date = end_date - timedelta(days=days)
-        
         q = text("""
-            SELECT date, close 
-            FROM idx_index_summary 
-            WHERE index_code = 'COMPOSITE' AND date >= :start AND date <= :end
+            SELECT date, close FROM idx_index_summary 
+            WHERE index_code = 'COMPOSITE' AND date >= :start AND date <= :end ORDER BY date ASC
+        """)
+        with storage.engine.connect() as conn:
+            df = pd.read_sql(q, conn, params={"start": start_date, "end": end_date})
+        if not df.empty and len(df) >= 50: return df
+        
+        print("  ⚠️ [IHSG] Data di DB kurang dari 50 hari. Fallback ke yfinance...")
+        import yfinance as yf
+        raw = yf.download("^JKSE", period="1y", interval="1d", progress=False, auto_adjust=True)
+        if raw is not None and not raw.empty:
+            if isinstance(raw.columns, pd.MultiIndex): raw.columns = raw.columns.get_level_values(0)
+            raw = raw.reset_index()
+            df_yf = raw.rename(columns={"Date": "date", "Close": "close"})[["date", "close"]].dropna()
+            if len(df_yf) >= 50: return df_yf
+        return None
+    except Exception as e:
+        print(f"  ❌ [Debug IHSG] Error: {e}")
+        return None
+
+def load_all_sector_indices(days: int = 365) -> dict:
+    """Ambil data history semua index sektoral sekaligus untuk efisiensi."""
+    sector_dfs = {}
+    try:
+        end_date = datetime.now().date()
+        start_date = end_date - timedelta(days=days)
+        q = text("""
+            SELECT date, index_code, close FROM idx_index_summary 
+            WHERE index_code LIKE 'IDX%' AND date >= :start AND date <= :end
             ORDER BY date ASC
         """)
         with storage.engine.connect() as conn:
             df = pd.read_sql(q, conn, params={"start": start_date, "end": end_date})
             
-        if not df.empty and len(df) >= 50:
-            return df
-            
-        # ── FALLBACK KE YFINANCE JIKA DATA DB KURANG DARI 50 HARI ──
-        print("  ⚠️ [IHSG] Data di DB kurang dari 50 hari. Fallback ke yfinance...")
-        import yfinance as yf
-        raw = yf.download("^JKSE", period="1y", interval="1d", progress=False, auto_adjust=True)
-        if raw is not None and not raw.empty:
-            if isinstance(raw.columns, pd.MultiIndex):
-                raw.columns = raw.columns.get_level_values(0)
-            raw = raw.reset_index()
-            df_yf = raw.rename(columns={"Date": "date", "Close": "close"})[["date", "close"]].dropna()
-            if len(df_yf) >= 50:
-                return df_yf
-                
-        return None
-    except Exception as e:
-        print(f"  ❌ [Debug IHSG] Error mengambil IHSG: {e}")
-        return None
+        if df.empty: return sector_dfs
         
-def quick_fundamental_check_from_db(ticker: str) -> dict:
-    """Cek PER & DER dari tabel financial_ratios."""
+        for code, group in df.groupby("index_code"):
+            if len(group) >= 50:
+                sector_dfs[code] = group.sort_values("date").reset_index(drop=True)
+        return sector_dfs
+    except Exception:
+        return sector_dfs
+
+def get_ticker_sectors() -> dict:
+    """Ambil mapping ticker -> sektor dari DB."""
     try:
-        q = text("""
-            SELECT per, der 
-            FROM financial_ratios 
-            WHERE code = :ticker 
-            ORDER BY year DESC, quarter DESC LIMIT 1
-        """)
+        q = text("SELECT ticker, sector FROM tickers WHERE is_active = TRUE")
+        with storage.engine.connect() as conn:
+            df = pd.read_sql(q, conn)
+        if df.empty: return {}
+        return dict(zip(df['ticker'], df['sector']))
+    except Exception:
+        return {}
+
+def get_sector_score(ticker: str, ticker_sector: str, sector_indices: dict) -> dict:
+    """Hitung skor sektor berdasarkan MA50 index sektoral."""
+    if not ticker_sector or not sector_indices:
+        return {"score": 50, "notes": "No Sector Data"}
+        
+    sector_upper = ticker_sector.upper()
+    target_index_code = None
+    
+    for key, idx_code in SECTOR_INDEX_MAP.items():
+        if key in sector_upper:
+            target_index_code = idx_code
+            break
+            
+    if not target_index_code or target_index_code not in sector_indices:
+        return {"score": 50, "notes": "Index Not Found"}
+        
+    df_sec = sector_indices[target_index_code]
+    lp = float(df_sec["close"].iloc[-1])
+    ma50 = float(df_sec["close"].rolling(50).mean().iloc[-1])
+    
+    if lp > ma50:
+        return {"score": 70, "notes": f"Sektor Uptrend (>{target_index_code} MA50)"}
+    else:
+        return {"score": 30, "notes": f"Sektor Downtrend (<{target_index_code} MA50)"}
+
+def quick_fundamental_check_from_db(ticker: str) -> dict:
+    try:
+        q = text("SELECT per, der FROM financial_ratios WHERE code = :ticker ORDER BY year DESC, quarter DESC LIMIT 1")
         with storage.engine.connect() as conn:
             row = conn.execute(q, {"ticker": ticker}).fetchone()
-            
-        if not row:
-            return {"pass": True, "penalty": 0, "notes": "No Fund Data"}
-            
+        if not row: return {"pass": True, "penalty": 0, "notes": "No Fund Data"}
         per = float(row[0]) if row[0] else 0
         der = float(row[1]) if row[1] else 0
-        fails = 0
-        notes = []
-        
-        if per > 60:
-            fails += 1
-            notes.append(f"PE tinggi ({per:.0f}x)")
-        if per < 0:
-            fails += 2
-            notes.append("Rugi (PE negatif)")
-        if der > 5.0:
-            fails += 1
-            notes.append(f"DER {der:.1f}x (berutang banyak)")
-            
+        fails, notes = 0, []
+        if per > 60: fails += 1; notes.append(f"PE tinggi ({per:.0f}x)")
+        if per < 0: fails += 2; notes.append("Rugi (PE negatif)")
+        if der > 5.0: fails += 1; notes.append(f"DER {der:.1f}x")
         penalty = min(15, fails * 7)
         return {"pass": fails <= 1, "penalty": penalty, "notes": " · ".join(notes) if notes else "OK"}
-    except Exception:
-        return {"pass": True, "penalty": 0, "notes": "Error"}
+    except Exception: return {"pass": True, "penalty": 0, "notes": "Error"}
 
 def get_smart_money_score(ticker: str) -> dict:
-    """Ambil skor Bandarmology dari tabel broker_flow & analytics_foreign_flow."""
     try:
-        q_broker = text("""
-            SELECT bandar_signal, foreign_net_broker, total_value 
-            FROM broker_flow 
-            WHERE ticker = :ticker 
-            ORDER BY date DESC LIMIT 1
-        """)
-        q_analytics = text("""
-            SELECT features 
-            FROM analytics_foreign_flow 
-            WHERE ticker = :ticker 
-            ORDER BY latest_date DESC LIMIT 1
-        """)
-        
+        q_broker = text("SELECT bandar_signal, foreign_net_broker, total_value FROM broker_flow WHERE ticker = :ticker ORDER BY date DESC LIMIT 1")
+        q_analytics = text("SELECT features FROM analytics_foreign_flow WHERE ticker = :ticker ORDER BY latest_date DESC LIMIT 1")
         with storage.engine.connect() as conn:
             b_row = conn.execute(q_broker, {"ticker": ticker}).fetchone()
             a_row = conn.execute(q_analytics, {"ticker": ticker}).fetchone()
-            
-        sm_score = 50.0
-        notes = []
-        
+        sm_score, notes = 50.0, []
         if b_row:
             sig = b_row[0] or "NEUTRAL"
             fnet = float(b_row[1] or 0)
             total_val = float(b_row[2] or 0)
-            
-            if sig in ("STRONG_ACCUMULATION",):
-                sm_score += 25
-                notes.append("Bandar Akumulasi Kuat 🔥")
-            elif sig in ("ACCUMULATION", "NET_BUY"):
-                sm_score += 15
-                notes.append("Bandar Akumulasi")
-            elif sig in ("STRONG_DISTRIBUTION",):
-                sm_score -= 25
-                notes.append("Bandar Distribusi 💀")
-            elif sig in ("DISTRIBUTION", "NET_SELL"):
-                sm_score -= 15
-                notes.append("Bandar Distribusi")
-                
+            if sig in ("STRONG_ACCUMULATION",): sm_score += 25; notes.append("Bandar Akumulasi Kuat 🔥")
+            elif sig in ("ACCUMULATION", "NET_BUY"): sm_score += 15; notes.append("Bandar Akumulasi")
+            elif sig in ("STRONG_DISTRIBUTION",): sm_score -= 25; notes.append("Bandar Distribusi 💀")
+            elif sig in ("DISTRIBUTION", "NET_SELL"): sm_score -= 15; notes.append("Bandar Distribusi")
             if total_val > 0:
                 fnet_pct = (fnet / total_val) * 100
-                if fnet_pct > 1.5:
-                    sm_score += 15
-                    notes.append(f"Asing Buy {fnet_pct:.1f}%")
-                elif fnet_pct < -1.5:
-                    sm_score -= 15
-                    notes.append(f"Asing Sell {fnet_pct:.1f}%")
-                
+                if fnet_pct > 1.5: sm_score += 15; notes.append(f"Asing Buy {fnet_pct:.1f}%")
+                elif fnet_pct < -1.5: sm_score -= 15; notes.append(f"Asing Sell {fnet_pct:.1f}%")
         if a_row and a_row[0]:
             features = a_row[0] if isinstance(a_row[0], dict) else json.loads(a_row[0])
             zscore = features.get("foreign_zscore", 0)
-            if zscore > 2.0:
-                sm_score += 15
-                notes.append(f"Foreign Anomaly Z:{zscore:.1f}")
-                
-        return {
-            "score": int(np.clip(round(sm_score), 0, 100)),
-            "notes": " · ".join(notes) if notes else "Netral"
-        }
-    except Exception:
-        return {"score": 50, "notes": "No SM Data"}
+            if zscore > 2.0: sm_score += 15; notes.append(f"Foreign Anomaly Z:{zscore:.1f}")
+        return {"score": int(np.clip(round(sm_score), 0, 100)), "notes": " · ".join(notes) if notes else "Netral"}
+    except Exception: return {"score": 50, "notes": "No SM Data"}
 
 # ══════════════════════════════════════════════════════
 #  TECHNICAL INDICATORS
@@ -223,9 +238,7 @@ def rsi(s, p=14):
     return (100 - 100 / (1 + g / l.replace(0, np.nan))).fillna(50)
 
 def wyckoff_phase(df, c, o):
-    n   = len(df)
-    p   = df["close"]
-    vol = df["volume"]
+    n, p, vol = len(df), df["close"], df["volume"]
     seg = max(n // 3, 5)
     tr  = (p.iloc[-seg:].mean() - p.iloc[:seg].mean()) / (p.iloc[:seg].mean() + 1e-9)
     r20 = (p.tail(20).max() - p.tail(20).min()) / (p.tail(20).mean() + 1e-9)
@@ -235,35 +248,26 @@ def wyckoff_phase(df, c, o):
     ob_rising  = float(o.iloc[-1]) > float(o.iloc[-min(10, n-1)])
     price_pos  = (p.iloc[-1] - p.tail(20).min()) / ((p.tail(20).max() - p.tail(20).min()) + 1e-9)
 
-    if tr < -0.06 and vol_climax and price_pos < 0.35:
-        return "A", "Selling Climax", min(90, 60 + int(abs(tr)*200))
-    if tr > 0.10 and ob_rising and price_pos > 0.75:
-        return "E", "Markup", min(88, 55 + int(tr*100))
-    if tr > 0.03 and ob_rising and vol_ratio >= 1.5 and price_pos > 0.65:
-        return "D", "Sign of Strength", min(85, 50 + int(tr*100))
+    if tr < -0.06 and vol_climax and price_pos < 0.35: return "A", "Selling Climax", min(90, 60 + int(abs(tr)*200))
+    if tr > 0.10 and ob_rising and price_pos > 0.75: return "E", "Markup", min(88, 55 + int(tr*100))
+    if tr > 0.03 and ob_rising and vol_ratio >= 1.5 and price_pos > 0.65: return "D", "Sign of Strength", min(85, 50 + int(tr*100))
 
-    p_min20 = p.tail(20).min()
-    p_min10 = p.tail(10).min()
-    broke   = p_min10 <= p_min20 * 1.002
-    recov   = float(p.iloc[-1]) > float(p.tail(5).min()) * 1.015
+    p_min20, p_min10 = p.tail(20).min(), p.tail(10).min()
+    broke = p_min10 <= p_min20 * 1.002
+    recov = float(p.iloc[-1]) > float(p.tail(5).min()) * 1.015
     lookback = min(180, n)
-    v_lb    = vol.iloc[-lookback:]
+    v_lb = vol.iloc[-lookback:]
     v_ma_lb = v_lb.rolling(20).mean()
     vol_hist = (v_lb / v_ma_lb.replace(0, np.nan)).fillna(0)
-    p_lb    = p.iloc[-lookback:]
-    had_a   = bool((vol_hist >= 2.5).any() and
-                   (p_lb.iloc[0] - p_lb.min()) / (p_lb.iloc[0] + 1) > 0.06)
-    if broke and recov and vol_climax and tr < 0.05 and r20 < 0.15 and had_a:
-        return "C", "Spring ⭐", min(85, 50 + int(vol_ratio*8))
-    if r20 < 0.10 and abs(tr) < 0.05:
-        return "B", "Building Cause", min(68, 35 + int((0.10-r20)*200))
+    p_lb = p.iloc[-lookback:]
+    had_a = bool((vol_hist >= 2.5).any() and (p_lb.iloc[0] - p_lb.min()) / (p_lb.iloc[0] + 1) > 0.06)
+    if broke and recov and vol_climax and tr < 0.05 and r20 < 0.15 and had_a: return "C", "Spring ⭐", min(85, 50 + int(vol_ratio*8))
+    if r20 < 0.10 and abs(tr) < 0.05: return "B", "Building Cause", min(68, 35 + int((0.10-r20)*200))
     return "B", "Indeterminate", 40
 
 def detect_vcp_grade(df) -> str:
     if len(df) < 60: return "NONE"
-    close = df["close"]
-    vol = df["volume"]
-    lp = float(close.iloc[-1])
+    close, vol, lp = df["close"], df["volume"], float(df["close"].iloc[-1])
     ma50 = float(close.rolling(50).mean().iloc[-1]) if len(df) >= 50 else lp
     ma150 = float(close.rolling(150).mean().iloc[-1]) if len(df) >= 150 else lp
     ma200 = float(close.rolling(200).mean().iloc[-1]) if len(df) >= 200 else lp
@@ -281,55 +285,44 @@ def detect_vcp_grade(df) -> str:
     return "NONE"
 
 # ══════════════════════════════════════════════════════
-#  HARD GATES & SCORING ENGINE
+#  SCORING ENGINE
 # ══════════════════════════════════════════════════════
 
-def check_hard_gates(df, wp: str, cmf_v: float, mfi_v: float, obv_s: pd.Series, vr: float, regime: dict = None) -> tuple:
-    n = len(df)
-    p = df["close"]
-
+def check_hard_gates(df, wp, cmf_v, mfi_v, obv_s, vr, regime=None) -> tuple:
+    n, p = len(df), df["close"]
     if wp == "A": return False, "Phase A (Selling Climax) — bukan area entry"
     if wp == "E": return False, "Phase E (Markup lanjut) — terlambat masuk"
-
     market_bearish = (regime or {}).get("regime") in ("BEAR", "CRASH", "RISK_OFF")
     if len(p) >= 50 and not market_bearish:
         ma50 = float(p.rolling(50).mean().iloc[-1])
         lp   = float(p.iloc[-1])
-        if wp == "B" and lp < ma50 * 0.98: return False, f"Phase B di bawah MA50 — downtrend"
+        if wp == "B" and lp < ma50 * 0.98: return False, f"Phase B di bawah MA50"
         if wp in ("C",):
             ma20 = float(p.rolling(20).mean().iloc[-1]) if len(p) >= 20 else lp
             if lp < ma20 * 0.92: return False, f"Phase C terlalu jauh di bawah MA20"
-
     if wp == "B":
-        if cmf_v < 0.05: return False, f"Phase B + CMF {cmf_v:+.3f} < 0.05 (inflow lemah)"
-        if mfi_v > 75: return False, f"Phase B + MFI {mfi_v:.0f} > 75 (belum oversold)"
+        if cmf_v < 0.05: return False, f"Phase B + CMF lemah"
+        if mfi_v > 75: return False, f"Phase B + MFI > 75"
         obv_up_10 = float(obv_s.iloc[-1]) > float(obv_s.iloc[-min(10, n-1)])
-        if not obv_up_10: return False, "Phase B + OBV tidak rising 10 hari"
-        if vr < 1.0: return False, f"Phase B + volume {vr:.1f}x (perlu konfirmasi >= 1.0x)"
-
+        if not obv_up_10: return False, "Phase B + OBV tidak rising"
+        if vr < 1.0: return False, f"Phase B + volume lemah"
     rsi_v = float(rsi(p).iloc[-1])
-    if wp == "B" and rsi_v > 75: return False, f"Phase B + RSI {rsi_v:.0f} > 65 (overbought)"
-    if wp == "D" and rsi_v > 72: return False, f"Phase D + RSI {rsi_v:.0f} > 72 (terlalu extend)"
-    if wp not in ("C",) and rsi_v < 20: return False, f"RSI {rsi_v:.0f} < 20 (extreme panic)"
-
-    if vr < 0.70 and wp != "C": return False, f"Volume {vr:.1f}x terlalu lemah"
+    if wp == "B" and rsi_v > 75: return False, f"Phase B + RSI overbought"
+    if wp == "D" and rsi_v > 72: return False, f"Phase D + RSI terlalu extend"
+    if wp not in ("C",) and rsi_v < 20: return False, f"RSI extreme panic"
+    if vr < 0.70 and wp != "C": return False, f"Volume terlalu lemah"
     return True, ""
 
 def get_market_regime(ihsg_df) -> dict:
-    if ihsg_df is None or len(ihsg_df) < 50:
-        return {"regime":"UNKNOWN","multiplier":1.0,"ok":True,"desc":"IHSG unavailable"}
-    p = ihsg_df["close"]
-    n = len(p)
-    ma50 = p.rolling(50).mean()
-    ma200 = p.rolling(min(200,n)).mean()
+    if ihsg_df is None or len(ihsg_df) < 50: return {"regime":"UNKNOWN","multiplier":1.0,"ok":True,"desc":"IHSG unavailable"}
+    p, n = ihsg_df["close"], len(ihsg_df)
+    ma50, ma200 = p.rolling(50).mean(), p.rolling(min(200,n)).mean()
     lp = float(p.iloc[-1])
     ret60 = (lp / float(p.iloc[-min(60,n-1)]) - 1) * 100
     peak = float(p.tail(252).max()) if n >= 252 else float(p.max())
     dd = (lp - peak) / peak * 100
-    above_ma50 = lp > float(ma50.iloc[-1])
-    above_ma200 = lp > float(ma200.iloc[-1])
+    above_ma50, above_ma200 = lp > float(ma50.iloc[-1]), lp > float(ma200.iloc[-1])
     ma50_up = float(ma50.iloc[-1]) > float(ma50.iloc[-min(20,n-1)])
-
     if dd < -40 or ret60 < -28: return {"regime":"CRASH", "multiplier":0.65, "ok":True, "desc":f"IHSG crash ({dd:.1f}%)"}
     elif dd < -20 or ret60 < -15: return {"regime":"BEAR", "multiplier":0.85, "ok":True, "desc":f"IHSG bear ({dd:.1f}%)"}
     elif (dd < -10 and not above_ma50) or ret60 < -12: return {"regime":"RISK_OFF", "multiplier":0.75,"ok":True, "desc":f"IHSG risk-off"}
@@ -340,8 +333,7 @@ def get_market_regime(ihsg_df) -> dict:
 def calc_rs(df, ihsg_df) -> dict:
     if ihsg_df is None or df is None: return {"score":50,"interp":"—","rs20":100}
     try:
-        merged = df[["close"]].rename(columns={"close":"stock"}).join(
-            ihsg_df[["close"]].rename(columns={"close":"ihsg"}), how="inner")
+        merged = df[["close"]].rename(columns={"close":"stock"}).join(ihsg_df[["close"]].rename(columns={"close":"ihsg"}), how="inner")
         if len(merged) < 25: return {"score":50,"interp":"—","rs20":100}
         n = len(merged)
         sr = (float(merged["stock"].iloc[-1]) / float(merged["stock"].iloc[-min(20,n-1)]) - 1) * 100
@@ -353,37 +345,29 @@ def calc_rs(df, ihsg_df) -> dict:
         elif rs20 < 93: interp = "UNDERPERFORM ▼"
         else: interp = "IN LINE →"
         return {"score":score, "interp":interp, "rs20":round(rs20,1)}
-    except:
-        return {"score":50,"interp":"—","rs20":100}
+    except: return {"score":50,"interp":"—","rs20":100}
 
-def compute_score_v4(df, ticker: str, ihsg_df, regime: dict) -> dict:
-    n = len(df)
-    p = min(14, max(7, n // 2))
-
-    c_ = cmf(df, p=p)
-    o_ = obv(df)
-    m_ = mfi(df, p=p)
-    a_ = atr(df, p=14)
+def compute_score_v5(df, ticker: str, ihsg_df, regime: dict, ticker_sector_map: dict, sector_indices: dict) -> dict:
+    n, p = len(df), min(14, max(7, len(df) // 2))
+    c_, o_ = cmf(df, p=p), obv(df)
+    m_, a_ = mfi(df, p=p), atr(df, p=14)
     r_ = rsi(df["close"], p=14)
     wp, wn, wconf = wyckoff_phase(df, c_, o_)
 
-    lp    = float(df["close"].iloc[-1])
+    lp = float(df["close"].iloc[-1])
     cmf_v = float(c_.iloc[-1]) if not pd.isna(c_.iloc[-1]) else 0.0
     mfi_v = float(m_.iloc[-1]) if not pd.isna(m_.iloc[-1]) else 50.0
     rsi_v = float(r_.iloc[-1]) if not pd.isna(r_.iloc[-1]) else 50.0
     atr_v = float(a_.iloc[-1]) if not pd.isna(a_.iloc[-1]) else lp * 0.02
     obv_up = float(o_.iloc[-1]) > float(o_.iloc[-min(10, n-1)])
-    av    = float(df["volume"].tail(20).mean())
-    vr    = float(df["volume"].iloc[-1]) / av if av > 0 else 1.0
-
+    av = float(df["volume"].tail(20).mean())
+    vr = float(df["volume"].iloc[-1]) / av if av > 0 else 1.0
     if atr_v == 0: return None
 
     passes, gate_reason = check_hard_gates(df, wp, cmf_v, mfi_v, o_, vr, regime)
-    if not passes:
-        return {"blocked": True, "reason": gate_reason, "wp": wp, "ticker": ticker}
+    if not passes: return {"blocked": True, "reason": gate_reason, "wp": wp, "ticker": ticker}
 
-    ts = 50.0
-    ts += float(np.clip(cmf_v * 120, -24, 24))
+    ts = 50.0 + float(np.clip(cmf_v * 120, -24, 24))
     if mfi_v < 30: ts += 15
     elif mfi_v < 45: ts += 7
     elif mfi_v > 70: ts -= 15
@@ -397,14 +381,19 @@ def compute_score_v4(df, ticker: str, ihsg_df, regime: dict) -> dict:
     sm_data = get_smart_money_score(ticker)
     fund = quick_fundamental_check_from_db(ticker)
     
+    # ── SECTOR ROTATION SCORE ──
+    sec_data = get_sector_score(ticker, ticker_sector_map.get(ticker, ""), sector_indices)
+    
     ticker_adj = TICKER_PENALTY.get(ticker, 0) + TICKER_BONUS.get(ticker, 0)
 
+    # Weighted Composite (Total 100%)
     raw = int(np.clip(round(
-        ts * 0.35 +          
-        sm_data["score"] * 0.35 +  
-        vcp_s * 0.10 +      
-        rs["score"] * 0.15 + 
-        50 * 0.05           
+        ts * 0.30 +               # Teknikal 30%
+        sm_data["score"] * 0.30 + # Smart Money 30%
+        sec_data["score"] * 0.15 + # Sektor Rotation 15% (BARU)
+        vcp_s * 0.10 +           # VCP 10%
+        rs["score"] * 0.10 +     # RS vs IHSG 10%
+        50 * 0.05                # Base 5%
     ), 0, 100))
 
     raw = raw + phase_bonus + ticker_adj - fund["penalty"]
@@ -417,7 +406,7 @@ def compute_score_v4(df, ticker: str, ihsg_df, regime: dict) -> dict:
 
     return {
         "blocked": False, "score": final, "ts": ts,
-        "sm_score": sm_data["score"],
+        "sm_score": sm_data["score"], "sec_score": sec_data["score"],
         "vcp_grade": vcp_grade, "wp": wp, "wn": wn,
         "cmf_v": round(cmf_v, 4), "mfi_v": round(mfi_v, 1),
         "rsi_v": round(rsi_v, 1), "obv_dir": "Rising ▲" if obv_up else "Falling ▼",
@@ -425,34 +414,26 @@ def compute_score_v4(df, ticker: str, ihsg_df, regime: dict) -> dict:
         "sl": sl, "sl_pct": round(sl_pct, 1), "tp": tp, "tp_pct": round(tp_pct, 1),
         "rs_interp": rs["interp"],
         "smart_money_notes": sm_data["notes"],
+        "sector_notes": sec_data["notes"],
         "fund_ok": fund["pass"], "fund_penalty": fund["penalty"],
         "signal_type": "STRONG_BUY" if final >= 78 else "BUY",
         "session": "", "ticker": ticker
     }
 
 # ══════════════════════════════════════════════════════
-#  DATABASE INJECTION (ML DUMMY & ANALYTICS)
+#  DATABASE INJECTION
 # ══════════════════════════════════════════════════════
 
 def save_analytics_to_db(candidates):
-    """Menyimpan seluruh kalkulasi hari ini ke tabel analytics_daily_signals."""
     if not candidates: return
-    
-    # Buat tabel jika belum ada
     with storage.engine.begin() as conn:
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS analytics_daily_signals (
-                date DATE NOT NULL,
-                ticker VARCHAR(20) NOT NULL,
-                ml_win_prob NUMERIC,
-                composite_score INT,
-                technical_score INT,
-                smart_money_score INT,
-                fundamental_score INT,
-                ml_label VARCHAR(20),
-                features_snapshot JSONB,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (date, ticker)
+                date DATE NOT NULL, ticker VARCHAR(20) NOT NULL,
+                ml_win_prob NUMERIC, composite_score INT, technical_score INT,
+                smart_money_score INT, sector_score INT, fundamental_score INT,
+                ml_label VARCHAR(20), features_snapshot JSONB,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (date, ticker)
             );
         """))
 
@@ -460,109 +441,96 @@ def save_analytics_to_db(candidates):
     try:
         with raw_conn.cursor() as cur:
             today = datetime.now().strftime("%Y-%m-%d")
-
             for c in candidates:
-                # Ambil skor dengan default 0/50 jika saham tersebut diblokir (tidak punya data lengkap)
                 comp_score = c.get('score', 0)
                 sm_score = c.get('sm_score', 50)
                 ts_score = c.get('ts', 50)
+                sec_score = c.get('sec_score', 50)
                 fund_pen = c.get('fund_penalty', 0)
                 
-                base_prob = float(comp_score) * 0.60 + float(sm_score) * 0.40
+                base_prob = float(comp_score) * 0.50 + float(sm_score) * 0.30 + float(sec_score) * 0.20
                 ml_win_prob = min(99.0, max(1.0, base_prob))
-
                 if ml_win_prob >= 65: ml_label = "WIN"
                 elif ml_win_prob >= 40: ml_label = "HOLD"
                 else: ml_label = "LOSS"
 
                 features = {
-                    "cmf": c.get("cmf_v"),
-                    "rsi": c.get("rsi_v"),
-                    "mfi": c.get("mfi_v"),
-                    "wyckoff_phase": c.get("wp"),
-                    "vcp_grade": c.get("vcp_grade"),
-                    "smart_money_notes": c.get("smart_money_notes")
+                    "cmf": c.get("cmf_v"), "rsi": c.get("rsi_v"), "mfi": c.get("mfi_v"),
+                    "wyckoff_phase": c.get("wp"), "vcp_grade": c.get("vcp_grade"),
+                    "smart_money_notes": c.get("smart_money_notes"),
+                    "sector_notes": c.get("sector_notes")
                 }
-
                 query = """
                 INSERT INTO analytics_daily_signals
-                (date, ticker, ml_win_prob, composite_score, technical_score, smart_money_score, fundamental_score, ml_label, features_snapshot)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                (date, ticker, ml_win_prob, composite_score, technical_score, smart_money_score, sector_score, fundamental_score, ml_label, features_snapshot)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (date, ticker) DO UPDATE SET
-                    ml_win_prob = EXCLUDED.ml_win_prob,
-                    composite_score = EXCLUDED.composite_score,
-                    technical_score = EXCLUDED.technical_score,
-                    smart_money_score = EXCLUDED.smart_money_score,
-                    fundamental_score = EXCLUDED.fundamental_score,
-                    ml_label = EXCLUDED.ml_label,
-                    features_snapshot = EXCLUDED.features_snapshot,
+                    ml_win_prob = EXCLUDED.ml_win_prob, composite_score = EXCLUDED.composite_score,
+                    technical_score = EXCLUDED.technical_score, smart_money_score = EXCLUDED.smart_money_score,
+                    sector_score = EXCLUDED.sector_score, fundamental_score = EXCLUDED.fundamental_score,
+                    ml_label = EXCLUDED.ml_label, features_snapshot = EXCLUDED.features_snapshot,
                     updated_at = CURRENT_TIMESTAMP;
                 """
                 cur.execute(query, (
-                    today, c['ticker'], ml_win_prob, comp_score, 
-                    ts_score, sm_score, 
+                    today, c['ticker'], ml_win_prob, comp_score, ts_score, sm_score, sec_score, 
                     100 - fund_pen, ml_label, json.dumps(features)
                 ))
-
             raw_conn.commit()
         print(f"\n  💾 [DB] Berhasil menyimpan {len(candidates)} setup analitik ke PostgreSQL.")
     except Exception as e:
         print(f"\n  ❌ [DB Error] Gagal menyimpan analitik: {e}")
     finally:
         raw_conn.close()
-        
+
 # ══════════════════════════════════════════════════════
 #  MAIN SCAN EXECUTION
 # ══════════════════════════════════════════════════════
 
-def _scan_tickers(tickers: list, session: str, ihsg_df, regime: dict, threshold: int) -> tuple:
+def _scan_tickers(tickers, session, ihsg_df, regime, threshold, ticker_sector_map, sector_indices) -> tuple:
     candidates, all_calculated, blocked_log = [], [], []
     for tk in tickers:
         if tk in TICKER_BLACKLIST: continue
         try:
             df = load_price_from_db(tk)
-            if df is None: 
-                continue
-            
+            if df is None: continue
             lp = float(df["close"].iloc[-1])
-            if lp < MIN_PRICE_IDR or float(df["volume"].iloc[-1]) < MIN_VOLUME_LOT: 
-                continue
+            if lp < MIN_PRICE_IDR or float(df["volume"].iloc[-1]) < MIN_VOLUME_LOT: continue
 
-            r = compute_score_v4(df, tk, ihsg_df, regime)
+            r = compute_score_v5(df, tk, ihsg_df, regime, ticker_sector_map, sector_indices)
             if r is None: continue
-            
             if r.get("blocked"):
                 blocked_log.append(f"  ⛔ {tk}: {r['reason']}")
-                r["score"] = 0
-                r["signal_type"] = "BLOCKED"
-                all_calculated.append(r)
-                continue
+                r["score"] = 0; r["signal_type"] = "BLOCKED"
+                all_calculated.append(r); continue
 
             r["session"] = session
             all_calculated.append(r)
-            
             if r["score"] >= threshold:
                 candidates.append(r)
-                print(f"  ✅ {tk}: {r['score']}/100 | {r['signal_type']} | SM:{r['sm_score']} | {r['smart_money_notes']}")
+                print(f"  ✅ {tk}: {r['score']}/100 | {r['signal_type']} | SM:{r['sm_score']} | Sec:{r['sec_score']} | {r['smart_money_notes']} | {r['sector_notes']}")
             else:
                 print(f"  ℹ️ {tk}: Skor {r['score']} di bawah threshold ({threshold}).")
-            
             time.sleep(0.05)
-
         except Exception as e:
             print(f"  ❌ {tk}: ERROR - {e}")
-            continue
-
     return candidates, all_calculated, blocked_log
 
 def scan_once(session: str = "DB_SCAN") -> list:
     print(f"\n{'='*58}")
-    print(f"BandarAI Scanner v4.0 (DB Native) — {session}")
+    print(f"BandarAI Scanner v5.0 (Sector Rotation) — {session}")
     print(f"{'='*58}")
 
     ihsg_df = load_ihsg_from_db()
     regime = get_market_regime(ihsg_df)
-    print(f"🌏 {regime['regime']} — {regime['desc']}\n")
+    print(f"🌏 {regime['regime']} — {regime['desc']}")
+
+    print("🏭 Mengambil data index sektoral dari database...")
+    sector_indices = load_all_sector_indices()
+    print(f"   -> {len(sector_indices)} index sektoral berhasil dimuat.")
+    
+    print("🏷️ Mengambil mapping sektor saham...")
+    ticker_sector_map = get_ticker_sectors()
+    print(f"   -> {len(ticker_sector_map)} mapping sektor berhasil dimuat.\n")
 
     if not regime["ok"]: return []
 
@@ -574,10 +542,9 @@ def scan_once(session: str = "DB_SCAN") -> list:
     tickers_to_scan = universe_mod.get_universe("all")
     print(f"📋 Total {len(tickers_to_scan)} saham akan di-scan.\n")
     
-    candidates, all_calc, blocked = _scan_tickers(tickers_to_scan, session, ihsg_df, regime, threshold)
+    candidates, all_calc, blocked = _scan_tickers(tickers_to_scan, session, ihsg_df, regime, threshold, ticker_sector_map, sector_indices)
     
-    if all_calc:
-        save_analytics_to_db(all_calc)
+    if all_calc: save_analytics_to_db(all_calc)
 
     candidates.sort(key=lambda x: x["score"], reverse=True)
     print(f"\n📊 Total Saham Dihitung: {len(all_calc)} | Sinyal BUY: {len(candidates)}")

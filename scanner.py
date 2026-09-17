@@ -1,12 +1,12 @@
 """
-BandarAI Signal Scanner v5.0 — DB Native, Smart Money & Sector Rotation
+Signal v1 — DB Native, Smart Money & Sector Rotation
 ======================================================================
-Perubahan utama dari v4.0:
+Perubahan utama:
+- PURE ALGORITHMIC: Menghapus Ticker Blacklist/Penalty/Bonus manual.
+  Semua saham dinilai murni dari perhitungan Teknikal, Smart Money, dan Sektor.
 - SECTOR ROTATION: Mengecek tren index sektoral (IDXENERGY, IDXFINANCE, dll).
-  Jika sektor sedang Bullish, skor naik. Jika Bearish, skor turun.
 - FULL DB INTEGRATION: Harga, Fundamental, & Sektor diambil dari PostgreSQL.
 - SCAN SEMUA SAHAM: Universe 'all' otomatis di-scan.
-- SMART MONEY SCORING: Membaca tabel broker_flow & analytics_foreign_flow.
 """
 
 import os
@@ -35,12 +35,7 @@ MIN_SCORE_TO_SIGNAL = getattr(config, "MIN_SCORE_TO_SIGNAL", 65)
 MIN_PRICE_IDR = getattr(config, "MIN_PRICE_IDR", 50)
 MIN_VOLUME_LOT = getattr(config, "MIN_VOLUME_LOT", 10000)
 
-TICKER_BLACKLIST = {"TLKM", "ICBP", "BREN", "MIKA", "KLBF"}
-TICKER_PENALTY = {"BSDE": -8, "CTRA": -8, "ASII": -6, "SMRA": -8, "AKRA": -8, "MYOR": -8}
-TICKER_BONUS = {"MDKA": +8, "ADRO": +5, "PTBA": +3, "ULTJ": +3}
-
 # ── MAPPING NAMA SEKTOR (DB) KE KODE INDEX (DB) ──
-# Ini memetakan kolom 'sector' di tabel tickers ke kolom 'index_code' di idx_index_summary
 SECTOR_INDEX_MAP = {
     "ENERGI": "IDXENERGY",
     "ENERGY": "IDXENERGY",
@@ -121,8 +116,7 @@ def load_all_sector_indices(days: int = 365) -> dict:
         if df.empty: return sector_dfs
         
         for code, group in df.groupby("index_code"):
-            # Turunkan minimum menjadi 20 hari agar bisa jalan walau data DB baru 1 bulan
-            if len(group) >= 20:
+            if len(group) >= 20: # Minimal 20 hari untuk MA20
                 sector_dfs[code] = group.sort_values("date").reset_index(drop=True)
         return sector_dfs
     except Exception:
@@ -158,7 +152,6 @@ def get_sector_score(ticker: str, ticker_sector: str, sector_indices: dict) -> d
     df_sec = sector_indices[target_index_code]
     lp = float(df_sec["close"].iloc[-1])
     
-    # Gunakan MA50 jika datanya cukup, jika tidak pakai MA20
     if len(df_sec) >= 50:
         ma = float(df_sec["close"].rolling(50).mean().iloc[-1])
         ma_label = "MA50"
@@ -357,7 +350,7 @@ def calc_rs(df, ihsg_df) -> dict:
         return {"score":score, "interp":interp, "rs20":round(rs20,1)}
     except: return {"score":50,"interp":"—","rs20":100}
 
-def compute_score_v5(df, ticker: str, ihsg_df, regime: dict, ticker_sector_map: dict, sector_indices: dict) -> dict:
+def compute_signal_v1(df, ticker: str, ihsg_df, regime: dict, ticker_sector_map: dict, sector_indices: dict) -> dict:
     n, p = len(df), min(14, max(7, len(df) // 2))
     c_, o_ = cmf(df, p=p), obv(df)
     m_, a_ = mfi(df, p=p), atr(df, p=14)
@@ -390,23 +383,19 @@ def compute_score_v5(df, ticker: str, ihsg_df, regime: dict, ticker_sector_map: 
     
     sm_data = get_smart_money_score(ticker)
     fund = quick_fundamental_check_from_db(ticker)
-    
-    # ── SECTOR ROTATION SCORE ──
     sec_data = get_sector_score(ticker, ticker_sector_map.get(ticker, ""), sector_indices)
-    
-    ticker_adj = TICKER_PENALTY.get(ticker, 0) + TICKER_BONUS.get(ticker, 0)
 
-    # Weighted Composite (Total 100%)
+    # Weighted Composite (Total 100%) - Murni Algoritma
     raw = int(np.clip(round(
         ts * 0.30 +               # Teknikal 30%
         sm_data["score"] * 0.30 + # Smart Money 30%
-        sec_data["score"] * 0.15 + # Sektor Rotation 15% (BARU)
+        sec_data["score"] * 0.15 + # Sektor Rotation 15%
         vcp_s * 0.10 +           # VCP 10%
         rs["score"] * 0.10 +     # RS vs IHSG 10%
         50 * 0.05                # Base 5%
     ), 0, 100))
 
-    raw = raw + phase_bonus + ticker_adj - fund["penalty"]
+    raw = raw + phase_bonus - fund["penalty"]
     final = int(np.clip(round(raw * regime.get("multiplier", 1.0)), 0, 100))
 
     sl = max(round(lp - 1.5 * atr_v, 0), round(float(df["low"].tail(10).min()) * 0.97, 0))
@@ -437,7 +426,6 @@ def compute_score_v5(df, ticker: str, ihsg_df, regime: dict, ticker_sector_map: 
 def save_analytics_to_db(candidates):
     if not candidates: return
     with storage.engine.begin() as conn:
-        # Buat tabel jika belum ada
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS analytics_daily_signals (
                 date DATE NOT NULL, ticker VARCHAR(20) NOT NULL,
@@ -447,7 +435,7 @@ def save_analytics_to_db(candidates):
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (date, ticker)
             );
         """))
-        # Tambah kolom sector_score jika belum ada (karena tabel sudah ada dari v4.0)
+        # Tambah kolom sector_score jika belum ada
         conn.execute(text("ALTER TABLE analytics_daily_signals ADD COLUMN IF NOT EXISTS sector_score INT;"))
 
     raw_conn = storage._get_raw_conn()
@@ -494,7 +482,7 @@ def save_analytics_to_db(candidates):
         print(f"\n  ❌ [DB Error] Gagal menyimpan analitik: {e}")
     finally:
         raw_conn.close()
-        
+
 # ══════════════════════════════════════════════════════
 #  MAIN SCAN EXECUTION
 # ══════════════════════════════════════════════════════
@@ -502,14 +490,13 @@ def save_analytics_to_db(candidates):
 def _scan_tickers(tickers, session, ihsg_df, regime, threshold, ticker_sector_map, sector_indices) -> tuple:
     candidates, all_calculated, blocked_log = [], [], []
     for tk in tickers:
-        if tk in TICKER_BLACKLIST: continue
         try:
             df = load_price_from_db(tk)
             if df is None: continue
             lp = float(df["close"].iloc[-1])
             if lp < MIN_PRICE_IDR or float(df["volume"].iloc[-1]) < MIN_VOLUME_LOT: continue
 
-            r = compute_score_v5(df, tk, ihsg_df, regime, ticker_sector_map, sector_indices)
+            r = compute_signal_v1(df, tk, ihsg_df, regime, ticker_sector_map, sector_indices)
             if r is None: continue
             if r.get("blocked"):
                 blocked_log.append(f"  ⛔ {tk}: {r['reason']}")
@@ -530,7 +517,7 @@ def _scan_tickers(tickers, session, ihsg_df, regime, threshold, ticker_sector_ma
 
 def scan_once(session: str = "DB_SCAN") -> list:
     print(f"\n{'='*58}")
-    print(f"BandarAI Scanner v5.0 (Sector Rotation) — {session}")
+    print(f"Signal v1 (DB Native, Smart Money & Sector Rotation) — {session}")
     print(f"{'='*58}")
 
     ihsg_df = load_ihsg_from_db()

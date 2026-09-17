@@ -14,13 +14,12 @@ _SRC = _ROOT / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from idx_bandarmology import storage, config
+from idx_bandarmology import storage, config, universe as universe_mod
 from sqlalchemy import text
 
 warnings.filterwarnings("ignore")
 
 # ── KONFIGURASI ──
-WATCHLIST = config.WATCHLIST
 MIN_SCORE_TO_SIGNAL = getattr(config, "MIN_SCORE_TO_SIGNAL", 65)
 MIN_PRICE_IDR = getattr(config, "MIN_PRICE_IDR", 50)
 MIN_VOLUME_LOT = getattr(config, "MIN_VOLUME_LOT", 10000)
@@ -83,7 +82,6 @@ def load_ihsg_from_db(days: int = 365) -> pd.DataFrame | None:
         if raw is not None and not raw.empty:
             if isinstance(raw.columns, pd.MultiIndex):
                 raw.columns = raw.columns.get_level_values(0)
-            # Reset index agar 'Date' menjadi kolom biasa
             raw = raw.reset_index()
             df_yf = raw.rename(columns={"Date": "date", "Close": "close"})[["date", "close"]].dropna()
             if len(df_yf) >= 50:
@@ -132,7 +130,6 @@ def quick_fundamental_check_from_db(ticker: str) -> dict:
 def get_smart_money_score(ticker: str) -> dict:
     """Ambil skor Bandarmology dari tabel broker_flow & analytics_foreign_flow."""
     try:
-        # Kita tambahkan total_value ke query untuk menghitung rasio persentase
         q_broker = text("""
             SELECT bandar_signal, foreign_net_broker, total_value 
             FROM broker_flow 
@@ -171,12 +168,8 @@ def get_smart_money_score(ticker: str) -> dict:
                 sm_score -= 15
                 notes.append("Bandar Distribusi")
                 
-            # ── PERBAIKAN: RASIO PERSENTASE ALIRAN ASING ──
-            # Cegah pembagian dengan nol jika total_val = 0
             if total_val > 0:
                 fnet_pct = (fnet / total_val) * 100
-                
-                # Threshold 1.5% (Berlaku untuk blue chip maupun saham kecil)
                 if fnet_pct > 1.5:
                     sm_score += 15
                     notes.append(f"Asing Buy {fnet_pct:.1f}%")
@@ -197,8 +190,9 @@ def get_smart_money_score(ticker: str) -> dict:
         }
     except Exception:
         return {"score": 50, "notes": "No SM Data"}
+
 # ══════════════════════════════════════════════════════
-#  TECHNICAL INDICATORS (Logika Asli Dipertahankan)
+#  TECHNICAL INDICATORS
 # ══════════════════════════════════════════════════════
 
 def cmf(df, p=14):
@@ -400,19 +394,17 @@ def compute_score_v4(df, ticker: str, ihsg_df, regime: dict) -> dict:
     vcp_s = {"A":90, "B":70, "C":40, "NONE":0}[vcp_grade]
     rs = calc_rs(df, ihsg_df)
     
-    # Ambil data dari DB
     sm_data = get_smart_money_score(ticker)
     fund = quick_fundamental_check_from_db(ticker)
     
     ticker_adj = TICKER_PENALTY.get(ticker, 0) + TICKER_BONUS.get(ticker, 0)
 
-    # Weighted Composite (Diperbarui)
     raw = int(np.clip(round(
-        ts * 0.35 +          # Teknikal 35%
-        sm_data["score"] * 0.35 +  # Smart Money 35% (Ditingkatkan!)
-        vcp_s * 0.10 +      # VCP 10%
-        rs["score"] * 0.15 + # RS 15%
-        50 * 0.05           # Base 5%
+        ts * 0.35 +          
+        sm_data["score"] * 0.35 +  
+        vcp_s * 0.10 +      
+        rs["score"] * 0.15 + 
+        50 * 0.05           
     ), 0, 100))
 
     raw = raw + phase_bonus + ticker_adj - fund["penalty"]
@@ -443,10 +435,8 @@ def compute_score_v4(df, ticker: str, ihsg_df, regime: dict) -> dict:
 # ══════════════════════════════════════════════════════
 
 def save_analytics_to_db(candidates):
-    """Menyimpan seluruh kalkulasi hari ini ke tabel analytics_daily_signals."""
     if not candidates: return
     
-    # Buat tabel jika belum ada
     with storage.engine.begin() as conn:
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS analytics_daily_signals (
@@ -518,40 +508,44 @@ def save_analytics_to_db(candidates):
 # ══════════════════════════════════════════════════════
 
 def _scan_tickers(tickers: list, session: str, ihsg_df, regime: dict, threshold: int) -> tuple:
-    candidates, blocked_log = [], []
+    candidates, all_calculated, blocked_log = [], [], []
     for tk in tickers:
         if tk in TICKER_BLACKLIST: continue
         try:
             df = load_price_from_db(tk)
             if df is None: 
-                print(f"  ⚠️ {tk}: Data harga di DB kosong/ tidak cukup.")
                 continue
             
             lp = float(df["close"].iloc[-1])
             if lp < MIN_PRICE_IDR or float(df["volume"].iloc[-1]) < MIN_VOLUME_LOT: 
-                print(f"  ⚠️ {tk}: Harga/Volume di bawah minimum.")
                 continue
 
             r = compute_score_v4(df, tk, ihsg_df, regime)
             if r is None: continue
+            
             if r.get("blocked"):
                 blocked_log.append(f"  ⛔ {tk}: {r['reason']}")
+                r["score"] = 0
+                r["signal_type"] = "BLOCKED"
+                all_calculated.append(r)
                 continue
 
             r["session"] = session
-            if r["score"] < threshold: 
-                print(f"  ℹ️ {tk}: Skor {r['score']} di bawah threshold ({threshold}).")
-                continue
+            all_calculated.append(r)
             
-            candidates.append(r)
-            print(f"  ✅ {tk}: {r['score']}/100 | {r['signal_type']} | SM:{r['sm_score']} | {r['smart_money_notes']}")
+            if r["score"] >= threshold:
+                candidates.append(r)
+                print(f"  ✅ {tk}: {r['score']}/100 | {r['signal_type']} | SM:{r['sm_score']} | {r['smart_money_notes']}")
+            else:
+                print(f"  ℹ️ {tk}: Skor {r['score']} di bawah threshold ({threshold}).")
+            
             time.sleep(0.05)
 
         except Exception as e:
             print(f"  ❌ {tk}: ERROR - {e}")
             continue
 
-    return candidates, blocked_log
+    return candidates, all_calculated, blocked_log
 
 def scan_once(session: str = "DB_SCAN") -> list:
     print(f"\n{'='*58}")
@@ -564,12 +558,21 @@ def scan_once(session: str = "DB_SCAN") -> list:
 
     if not regime["ok"]: return []
 
-    candidates, blocked = _scan_tickers(WATCHLIST, session, ihsg_df, regime, MIN_SCORE_TO_SIGNAL)
+    threshold = MIN_SCORE_TO_SIGNAL
+    if regime.get("regime") in ("BEAR", "CRASH", "RISK_OFF"):
+        threshold = max(30, threshold - 28)
     
-    if candidates:
-        save_analytics_to_db(candidates)
+    print("🔍 Mengambil daftar seluruh saham aktif dari database...")
+    tickers_to_scan = universe_mod.get_universe("all")
+    print(f"📋 Total {len(tickers_to_scan)} saham akan di-scan.\n")
+    
+    candidates, all_calc, blocked = _scan_tickers(tickers_to_scan, session, ihsg_df, regime, threshold)
+    
+    if all_calc:
+        save_analytics_to_db(all_calc)
 
     candidates.sort(key=lambda x: x["score"], reverse=True)
+    print(f"\n📊 Total Saham Dihitung: {len(all_calc)} | Sinyal BUY: {len(candidates)}")
     return candidates[:5]
 
 if __name__ == "__main__":

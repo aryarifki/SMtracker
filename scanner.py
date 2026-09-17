@@ -67,7 +67,7 @@ def load_ihsg_from_db(days: int = 365) -> pd.DataFrame | None:
         q = text("""
             SELECT date, close 
             FROM idx_index_summary 
-            WHERE index_code = 'IHSG' AND date >= :start AND date <= :end
+            WHERE index_code = 'COMPOSITE' AND date >= :start AND date <= :end
             ORDER BY date ASC
         """)
         with storage.engine.connect() as conn:
@@ -508,10 +508,14 @@ def _scan_tickers(tickers: list, session: str, ihsg_df, regime: dict, threshold:
         if tk in TICKER_BLACKLIST: continue
         try:
             df = load_price_from_db(tk)
-            if df is None: continue
+            if df is None: 
+                print(f"  ⚠️ {tk}: Data harga di DB kosong/ tidak cukup.")
+                continue
             
             lp = float(df["close"].iloc[-1])
-            if lp < MIN_PRICE_IDR or float(df["volume"].iloc[-1]) < MIN_VOLUME_LOT: continue
+            if lp < MIN_PRICE_IDR or float(df["volume"].iloc[-1]) < MIN_VOLUME_LOT: 
+                print(f"  ⚠️ {tk}: Harga/Volume di bawah minimum.")
+                continue
 
             r = compute_score_v4(df, tk, ihsg_df, regime)
             if r is None: continue
@@ -520,13 +524,16 @@ def _scan_tickers(tickers: list, session: str, ihsg_df, regime: dict, threshold:
                 continue
 
             r["session"] = session
-            if r["score"] < threshold: continue
+            if r["score"] < threshold: 
+                print(f"  ℹ️ {tk}: Skor {r['score']} di bawah threshold ({threshold}).")
+                continue
             
             candidates.append(r)
             print(f"  ✅ {tk}: {r['score']}/100 | {r['signal_type']} | SM:{r['sm_score']} | {r['smart_money_notes']}")
             time.sleep(0.05)
 
-        except Exception:
+        except Exception as e:
+            print(f"  ❌ {tk}: ERROR - {e}")
             continue
 
     return candidates, blocked_log

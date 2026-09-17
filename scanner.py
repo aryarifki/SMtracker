@@ -59,7 +59,7 @@ def load_price_from_db(ticker: str, days: int = 365) -> pd.DataFrame | None:
         return None
 
 def load_ihsg_from_db(days: int = 365) -> pd.DataFrame | None:
-    """Ambil data IHSG dari tabel idx_index_summary."""
+    """Ambil data IHSG dari tabel idx_index_summary. Fallback ke yfinance jika data < 50 hari."""
     try:
         end_date = datetime.now().date()
         start_date = end_date - timedelta(days=days)
@@ -73,12 +73,25 @@ def load_ihsg_from_db(days: int = 365) -> pd.DataFrame | None:
         with storage.engine.connect() as conn:
             df = pd.read_sql(q, conn, params={"start": start_date, "end": end_date})
             
-        if df.empty or len(df) < 50:
-            return None
-        return df
-    except Exception:
+        if not df.empty and len(df) >= 50:
+            return df
+            
+        # ── FALLBACK KE YFINANCE JIKA DATA DB KURANG DARI 50 HARI ──
+        print("  ⚠️ [IHSG] Data di DB kurang dari 50 hari. Fallback ke yfinance...")
+        import yfinance as yf
+        raw = yf.download("^JKSE", period="1y", interval="1d", progress=False, auto_adjust=True)
+        if raw is not None and not raw.empty:
+            if isinstance(raw.columns, pd.MultiIndex):
+                raw.columns = raw.columns.get_level_values(0)
+            df_yf = raw.rename(columns={"Date": "date", "Close": "close"})[["date", "close"]].dropna()
+            if len(df_yf) >= 50:
+                return df_yf
+                
         return None
-
+    except Exception as e:
+        print(f"  ❌ [Debug IHSG] Error mengambil IHSG: {e}")
+        return None
+        
 def quick_fundamental_check_from_db(ticker: str) -> dict:
     """Cek PER & DER dari tabel financial_ratios."""
     try:

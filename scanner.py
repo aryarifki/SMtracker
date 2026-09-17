@@ -121,7 +121,8 @@ def load_all_sector_indices(days: int = 365) -> dict:
         if df.empty: return sector_dfs
         
         for code, group in df.groupby("index_code"):
-            if len(group) >= 50:
+            # Turunkan minimum menjadi 20 hari agar bisa jalan walau data DB baru 1 bulan
+            if len(group) >= 20:
                 sector_dfs[code] = group.sort_values("date").reset_index(drop=True)
         return sector_dfs
     except Exception:
@@ -139,7 +140,7 @@ def get_ticker_sectors() -> dict:
         return {}
 
 def get_sector_score(ticker: str, ticker_sector: str, sector_indices: dict) -> dict:
-    """Hitung skor sektor berdasarkan MA50 index sektoral."""
+    """Hitung skor sektor berdasarkan MA50/MA20 index sektoral."""
     if not ticker_sector or not sector_indices:
         return {"score": 50, "notes": "No Sector Data"}
         
@@ -156,12 +157,21 @@ def get_sector_score(ticker: str, ticker_sector: str, sector_indices: dict) -> d
         
     df_sec = sector_indices[target_index_code]
     lp = float(df_sec["close"].iloc[-1])
-    ma50 = float(df_sec["close"].rolling(50).mean().iloc[-1])
     
-    if lp > ma50:
-        return {"score": 70, "notes": f"Sektor Uptrend (>{target_index_code} MA50)"}
+    # Gunakan MA50 jika datanya cukup, jika tidak pakai MA20
+    if len(df_sec) >= 50:
+        ma = float(df_sec["close"].rolling(50).mean().iloc[-1])
+        ma_label = "MA50"
+    elif len(df_sec) >= 20:
+        ma = float(df_sec["close"].rolling(20).mean().iloc[-1])
+        ma_label = "MA20"
     else:
-        return {"score": 30, "notes": f"Sektor Downtrend (<{target_index_code} MA50)"}
+        return {"score": 50, "notes": "Data Sektor Kurang"}
+    
+    if lp > ma:
+        return {"score": 70, "notes": f"Sektor Uptrend (>{target_index_code} {ma_label})"}
+    else:
+        return {"score": 30, "notes": f"Sektor Downtrend (<{target_index_code} {ma_label})"}
 
 def quick_fundamental_check_from_db(ticker: str) -> dict:
     try:
@@ -427,15 +437,18 @@ def compute_score_v5(df, ticker: str, ihsg_df, regime: dict, ticker_sector_map: 
 def save_analytics_to_db(candidates):
     if not candidates: return
     with storage.engine.begin() as conn:
+        # Buat tabel jika belum ada
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS analytics_daily_signals (
                 date DATE NOT NULL, ticker VARCHAR(20) NOT NULL,
                 ml_win_prob NUMERIC, composite_score INT, technical_score INT,
-                smart_money_score INT, sector_score INT, fundamental_score INT,
+                smart_money_score INT, fundamental_score INT,
                 ml_label VARCHAR(20), features_snapshot JSONB,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (date, ticker)
             );
         """))
+        # Tambah kolom sector_score jika belum ada (karena tabel sudah ada dari v4.0)
+        conn.execute(text("ALTER TABLE analytics_daily_signals ADD COLUMN IF NOT EXISTS sector_score INT;"))
 
     raw_conn = storage._get_raw_conn()
     try:
@@ -481,7 +494,7 @@ def save_analytics_to_db(candidates):
         print(f"\n  ❌ [DB Error] Gagal menyimpan analitik: {e}")
     finally:
         raw_conn.close()
-
+        
 # ══════════════════════════════════════════════════════
 #  MAIN SCAN EXECUTION
 # ══════════════════════════════════════════════════════

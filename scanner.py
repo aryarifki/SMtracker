@@ -373,6 +373,20 @@ def compute_signal_v1(df, ticker: str, ihsg_df, regime: dict, ticker_sector_map:
     fund = quick_fundamental_check_from_db(ticker)
     sec_data = get_sector_score(ticker, ticker_sector_map.get(ticker, ""), sector_indices)
 
+    # ── BIG CAP COMPENSATION (Cap-Tiering) ──
+    avg_turnover = float(df["value"].tail(20).mean())
+    
+    # Fallback pencegahan jika kolom value bernilai 0 (karena data fallback dari yfinance)
+    if avg_turnover == 0:
+        avg_turnover = float((df["close"] * df["volume"] * 100).tail(20).mean())
+        
+    big_cap_bonus = 0
+    if avg_turnover >= 75_000_000_000:
+        big_cap_bonus = 12  # Kompensasi Bluechip (LQ45/IDX80)
+    elif avg_turnover >= 25_000_000_000:
+        big_cap_bonus = 6   # Kompensasi Mid-Cap
+
+    # Weighted Composite (Total 100%) - Murni Algoritma
     raw = int(np.clip(round(
         ts * 0.30 +               
         sm_data["score"] * 0.30 + 
@@ -382,7 +396,8 @@ def compute_signal_v1(df, ticker: str, ihsg_df, regime: dict, ticker_sector_map:
         50 * 0.05                
     ), 0, 100))
 
-    raw = raw + phase_bonus - fund["penalty"]
+    # Suntikkan bonus kapitalisasi di sini agar Big Cap bisa lolos threshold
+    raw = raw + phase_bonus + big_cap_bonus - fund["penalty"]
     final = int(np.clip(round(raw * regime.get("multiplier", 1.0)), 0, 100))
 
     sl = max(round(lp - 1.5 * atr_v, 0), round(float(df["low"].tail(10).min()) * 0.97, 0))
@@ -405,7 +420,7 @@ def compute_signal_v1(df, ticker: str, ihsg_df, regime: dict, ticker_sector_map:
         "signal_type": "STRONG_BUY" if final >= 78 else "BUY",
         "session": "", "ticker": ticker
     }
-
+    
 # ══════════════════════════════════════════════════════
 #  DATABASE INJECTION & JSON VALIDATION
 # ══════════════════════════════════════════════════════

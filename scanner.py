@@ -1,11 +1,11 @@
 """
-Signal v1.2 — DB Native, Smart Money, Sector Rotation & Soft Gates
+Signal v1.2 — DB Native, Smart Money, Sector Rotation & Soft Gates (AI Ready)
 ======================================================================
-Perubahan utama dari v1.1:
+Perubahan utama:
 - SOFT GATES: Tidak ada saham yang diblokir di awal. Fase A/E & Volume lemah diberi penalti skor.
 - BIG CAP COMPENSATION: Saham LQ45/IDX80 mendapat bonus skor agar bisa bersaing dengan saham kecil.
 - FULL DB INTEGRATION: Harga, Fundamental, & Sektor diambil dari PostgreSQL.
-- DATA VALIDATION: Kolom Turnover (value) yang kosong diisi matematis agar yfinance & idx_api bisa berdampingan.
+- AI DATA COLLECTION: Sinyal BUY otomatis dicatat ke tabel `signals` untuk dilatih oleh XGBoost nantinya.
 """
 
 import os
@@ -353,10 +353,10 @@ def get_market_regime(ihsg_df) -> dict:
     ma50_up = float(ma50.iloc[-1]) > float(ma50.iloc[-min(20,n-1)])
     if dd < -40 or ret60 < -28: return {"regime":"CRASH", "multiplier":0.65, "ok":True, "desc":f"IHSG crash ({dd:.1f}%)"}
     elif dd < -20 or ret60 < -15: return {"regime":"BEAR", "multiplier":0.85, "ok":True, "desc":f"IHSG bear ({dd:.1f}%)"}
-    elif (dd < -10 and not above_ma50) or ret60 < -12: return {"regime":"RISK_OFF", "multiplier":0.75,"ok":True, "desc":f"IHSG risk-off"}
-    elif dd < -5 and above_ma200 and ret60 < -3: return {"regime":"CORRECTION", "multiplier":0.90,"ok":True, "desc":f"IHSG koreksi"}
-    elif above_ma50 and above_ma200 and ma50_up: return {"regime":"BULL", "multiplier":1.05,"ok":True, "desc":f"IHSG uptrend"}
-    return {"regime":"MIXED", "multiplier":0.90,"ok":True, "desc":f"IHSG mixed"}
+    elif (dd < -10 and not above_ma50) or ret60 < -12: return {"regime":"RISK_OFF", "multiplier":0.75,"ok":True,"desc":f"IHSG risk-off"}
+    elif dd < -5 and above_ma200 and ret60 < -3: return {"regime":"CORRECTION", "multiplier":0.90,"ok":True,"desc":f"IHSG koreksi"}
+    elif above_ma50 and above_ma200 and ma50_up: return {"regime":"BULL", "multiplier":1.05,"ok":True,"desc":f"IHSG uptrend"}
+    return {"regime":"MIXED", "multiplier":0.90,"ok":True,"desc":f"IHSG mixed"}
 
 def calc_rs(df, ihsg_df) -> dict:
     if ihsg_df is None or df is None: return {"score":50,"interp":"—","rs20":100}
@@ -535,6 +535,45 @@ def save_analytics_to_db(candidates):
     finally:
         raw_conn.close()
 
+def log_signal_to_db(r: dict):
+    """Mencatat sinyal BUY ke tabel signals untuk AI Training (Auditor)."""
+    sig_id = f"SIG-{r['ticker']}-{datetime.now().strftime('%Y%m%d')}"
+    features_json = json.dumps({
+        "composite_score": r["score"], "sm_score": r["sm_score"], "sec_score": r["sec_score"],
+        "ts": r["ts"], "wp": r["wp"], "vcp_grade": r["vcp_grade"], "cmf_v": r["cmf_v"],
+        "rsi_v": r["rsi_v"], "mfi_v": r["mfi_v"], "gate_notes": r["gate_notes"]
+    })
+    
+    raw_conn = storage._get_raw_conn()
+    try:
+        with raw_conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS signals (
+                    id VARCHAR(50) PRIMARY KEY,
+                    ticker VARCHAR(20) NOT NULL,
+                    signal_date DATE NOT NULL,
+                    entry_price NUMERIC NOT NULL,
+                    tp_price NUMERIC NOT NULL,
+                    sl_price NUMERIC NOT NULL,
+                    features_snapshot JSONB,
+                    status VARCHAR(20) DEFAULT 'OPEN',
+                    exit_price NUMERIC,
+                    exit_date DATE,
+                    days_held INT,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            cur.execute("""
+                INSERT INTO signals (id, ticker, signal_date, entry_price, tp_price, sl_price, features_snapshot, status)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, 'OPEN')
+                ON CONFLICT (id) DO NOTHING;
+            """, (sig_id, r['ticker'], datetime.now().date(), r['lp'], r['tp'], r['sl'], features_json))
+        raw_conn.commit()
+    except Exception as e:
+        print(f"  ⚠️ [DB Error] Gagal catat sinyal {r['ticker']}: {e}")
+    finally:
+        raw_conn.close()
+
 # ══════════════════════════════════════════════════════
 #  MAIN SCAN EXECUTION
 # ══════════════════════════════════════════════════════
@@ -567,6 +606,8 @@ def _scan_tickers(tickers, session, ihsg_df, regime, threshold, ticker_sector_ma
             all_calculated.append(r)
             if r["score"] >= threshold:
                 candidates.append(r)
+                # Catat sinyal ke tabel signals untuk AI Training
+                log_signal_to_db(r)
                 print(f"  ✅ {tk}: {r['score']}/100 | {r['signal_type']} | SM:{r['sm_score']} | Sec:{r['sec_score']} | {r['smart_money_notes']} | {r['sector_notes']} | Gates: {r['gate_notes']}")
             else:
                 print(f"  ℹ️ {tk}: Skor {r['score']} di bawah threshold ({threshold}). Gates: {r['gate_notes']}")

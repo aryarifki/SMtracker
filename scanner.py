@@ -1,6 +1,11 @@
 """
-Signal v1.1 — DB Native, Smart Money, Sector Rotation & Data Validation
+Signal v1.2 — DB Native, Smart Money, Sector Rotation & Soft Gates
 ======================================================================
+Perubahan utama dari v1.1:
+- SOFT GATES: Tidak ada saham yang diblokir di awal. Fase A/E & Volume lemah diberi penalti skor.
+- BIG CAP COMPENSATION: Saham LQ45/IDX80 mendapat bonus skor agar bisa bersaing dengan saham kecil.
+- FULL DB INTEGRATION: Harga, Fundamental, & Sektor diambil dari PostgreSQL.
+- DATA VALIDATION: Kolom Turnover (value) yang kosong diisi matematis agar yfinance & idx_api bisa berdampingan.
 """
 
 import os
@@ -54,14 +59,13 @@ def load_price_from_db(ticker: str, days: int = 365) -> pd.DataFrame | None:
         df = storage.read_prices(tickers=[ticker], start_date=start_date, end_date=end_date)
         if df is None or df.empty or len(df) < 20: return None
         
-        # PERBAIKAN: Menarik kolom "value" secara presisi untuk filter Turnover
         df = df.rename(columns={"open": "open", "high": "high", "low": "low", "close": "close", "volume": "volume", "value": "value"})
         df = df[["date", "open", "high", "low", "close", "volume", "value"]]
         
-        # PERBAIKAN: Dropna HANYA untuk kolom wajib (OHLCV), agar saham yfinance (yang valuenya None) tidak ikut terbuang
+        # Dropna HANYA untuk kolom wajib (OHLCV), agar saham yfinance (yang valuenya None) tidak ikut terbuang
         df = df.dropna(subset=["date", "open", "high", "low", "close", "volume"])
         
-        # PERBAIKAN: Isi kolom value yang kosong (None) dengan 0 agar tidak error saat di-convert ke float
+        # Isi kolom value yang kosong (None) dengan 0 agar tidak error saat di-convert ke float
         df["value"] = df["value"].fillna(0)
         
         df = df.sort_values("date").reset_index(drop=True)
@@ -192,7 +196,7 @@ def get_smart_money_score(ticker: str) -> dict:
     except Exception: return {"score": 50, "notes": "No SM Data"}
 
 # ══════════════════════════════════════════════════════
-#  TECHNICAL INDICATORS & SCORING ENGINE
+#  TECHNICAL INDICATORS
 # ══════════════════════════════════════════════════════
 
 def cmf(df, p=14):
@@ -278,31 +282,64 @@ def is_goreng_pump(df, pump_thresh: float = 15.0, vol_thresh: float = 5.0) -> tu
     if ret3 > pump_thresh and vr > 2.5: return True, f"Pump: +{ret3:.1f}% dalam 3 hari, volume {vr:.1f}x"
     if vr > vol_thresh: return True, f"Volume spike ekstrem {vr:.1f}x tanpa fundamental"
     return False, ""
-    
-def check_hard_gates(df, wp, cmf_v, mfi_v, obv_s, vr, regime=None) -> tuple:
+
+# ══════════════════════════════════════════════════════
+#  SOFT GATES (PENALTI, BUKAN BLOKIR)
+# ══════════════════════════════════════════════════════
+
+def check_soft_gates(df, wp, cmf_v, mfi_v, obv_s, vr, regime=None, avg_turnover=0) -> tuple:
+    """Mengembalikan (passes=True, penalty=0) jika bagus. Jika buruk, passes=True tapi kena penalty."""
     n, p = len(df), df["close"]
-    if wp == "A": return False, "Phase A (Selling Climax) — bukan area entry"
-    if wp == "E": return False, "Phase E (Markup lanjut) — terlambat masuk"
+    penalty = 0
+    reasons = []
+
+    # 1. Fase Berbahaya (Soft Penalty, bukan blokir)
+    if wp == "A":
+        penalty += 40
+        reasons.append("Penalti Fase A (Selling Climax)")
+    if wp == "E":
+        penalty += 40
+        reasons.append("Penalti Fase E (Markup)")
+
     market_bearish = (regime or {}).get("regime") in ("BEAR", "CRASH", "RISK_OFF")
     if len(p) >= 50 and not market_bearish:
         ma50 = float(p.rolling(50).mean().iloc[-1])
         lp   = float(p.iloc[-1])
-        if wp == "B" and lp < ma50 * 0.98: return False, f"Phase B di bawah MA50"
+        if wp == "B" and lp < ma50 * 0.98:
+            penalty += 10
+            reasons.append("Phase B < MA50")
         if wp in ("C",):
             ma20 = float(p.rolling(20).mean().iloc[-1]) if len(p) >= 20 else lp
-            if lp < ma20 * 0.92: return False, f"Phase C terlalu jauh di bawah MA20"
+            if lp < ma20 * 0.92:
+                penalty += 10
+                reasons.append("Phase C turun dalam")
+
+    # 2. Volume Immunity untuk Big Cap
+    vol_threshold = 0.8 if avg_turnover >= 75_000_000_000 else 1.0
+    if wp == "B" and vr < vol_threshold:
+        penalty += 15
+        reasons.append(f"Vol {vr:.1f}x < {vol_threshold}x")
+        
     if wp == "B":
-        if cmf_v < 0.05: return False, f"Phase B + CMF lemah"
-        if mfi_v > 75: return False, f"Phase B + MFI > 75"
-        obv_up_10 = float(obv_s.iloc[-1]) > float(obv_s.iloc[-min(10, n-1)])
-        if not obv_up_10: return False, "Phase B + OBV tidak rising"
-        if vr < 1.0: return False, f"Phase B + volume lemah"
+        if cmf_v < 0.05:
+            penalty += 5
+            reasons.append("CMF lemah")
+        if mfi_v > 75:
+            penalty += 10
+            reasons.append("MFI > 75")
+        
     rsi_v = float(rsi(p).iloc[-1])
-    if wp == "B" and rsi_v > 75: return False, f"Phase B + RSI overbought"
-    if wp == "D" and rsi_v > 72: return False, f"Phase D + RSI terlalu extend"
-    if wp not in ("C",) and rsi_v < 20: return False, f"RSI extreme panic"
-    if vr < 0.70 and wp != "C": return False, f"Volume terlalu lemah"
-    return True, ""
+    if wp == "B" and rsi_v > 75:
+        penalty += 10
+        reasons.append("RSI > 75")
+    if wp == "D" and rsi_v > 72:
+        penalty += 10
+        reasons.append("RSI > 72")
+    if wp not in ("C",) and rsi_v < 20:
+        penalty += 10
+        reasons.append("RSI < 20")
+
+    return True, penalty, " | ".join(reasons) if reasons else "Clear"
 
 def get_market_regime(ihsg_df) -> dict:
     if ihsg_df is None or len(ihsg_df) < 50: return {"regime":"UNKNOWN","multiplier":1.0,"ok":True,"desc":"IHSG unavailable"}
@@ -338,6 +375,10 @@ def calc_rs(df, ihsg_df) -> dict:
         return {"score":score, "interp":interp, "rs20":round(rs20,1)}
     except: return {"score":50,"interp":"—","rs20":100}
 
+# ══════════════════════════════════════════════════════
+#  SCORING ENGINE
+# ══════════════════════════════════════════════════════
+
 def compute_signal_v1(df, ticker: str, ihsg_df, regime: dict, ticker_sector_map: dict, sector_indices: dict) -> dict:
     n, p = len(df), min(14, max(7, len(df) // 2))
     c_, o_ = cmf(df, p=p), obv(df)
@@ -355,8 +396,20 @@ def compute_signal_v1(df, ticker: str, ihsg_df, regime: dict, ticker_sector_map:
     vr = float(df["volume"].iloc[-1]) / av if av > 0 else 1.0
     if atr_v == 0: return None
 
-    passes, gate_reason = check_hard_gates(df, wp, cmf_v, mfi_v, o_, vr, regime)
-    if not passes: return {"blocked": True, "reason": gate_reason, "wp": wp, "ticker": ticker}
+    # ── HITUNG TURNOVER SEBELUM SOFT GATES ──
+    avg_turnover = float(df["value"].tail(20).mean())
+    if avg_turnover == 0:
+        avg_turnover = float((df["close"] * df["volume"] * 100).tail(20).mean())
+
+    # ── BIG CAP COMPENSATION (Cap-Tiering) ──
+    big_cap_bonus = 0
+    if avg_turnover >= 75_000_000_000:
+        big_cap_bonus = 12  # Kompensasi Bluechip (LQ45/IDX80)
+    elif avg_turnover >= 25_000_000_000:
+        big_cap_bonus = 6   # Kompensasi Mid-Cap
+
+    # Panggil Soft Gates
+    passes, gate_penalty, gate_reason = check_soft_gates(df, wp, cmf_v, mfi_v, o_, vr, regime, avg_turnover)
 
     ts = 50.0 + float(np.clip(cmf_v * 120, -24, 24))
     if mfi_v < 30: ts += 15
@@ -373,19 +426,6 @@ def compute_signal_v1(df, ticker: str, ihsg_df, regime: dict, ticker_sector_map:
     fund = quick_fundamental_check_from_db(ticker)
     sec_data = get_sector_score(ticker, ticker_sector_map.get(ticker, ""), sector_indices)
 
-    # ── BIG CAP COMPENSATION (Cap-Tiering) ──
-    avg_turnover = float(df["value"].tail(20).mean())
-    
-    # Fallback pencegahan jika kolom value bernilai 0 (karena data fallback dari yfinance)
-    if avg_turnover == 0:
-        avg_turnover = float((df["close"] * df["volume"] * 100).tail(20).mean())
-        
-    big_cap_bonus = 0
-    if avg_turnover >= 75_000_000_000:
-        big_cap_bonus = 12  # Kompensasi Bluechip (LQ45/IDX80)
-    elif avg_turnover >= 25_000_000_000:
-        big_cap_bonus = 6   # Kompensasi Mid-Cap
-
     # Weighted Composite (Total 100%) - Murni Algoritma
     raw = int(np.clip(round(
         ts * 0.30 +               
@@ -396,8 +436,8 @@ def compute_signal_v1(df, ticker: str, ihsg_df, regime: dict, ticker_sector_map:
         50 * 0.05                
     ), 0, 100))
 
-    # Suntikkan bonus kapitalisasi di sini agar Big Cap bisa lolos threshold
-    raw = raw + phase_bonus + big_cap_bonus - fund["penalty"]
+    # Suntikkan bonus kapitalisasi dan penalti gate di sini
+    raw = raw + phase_bonus + big_cap_bonus - fund["penalty"] - gate_penalty
     final = int(np.clip(round(raw * regime.get("multiplier", 1.0)), 0, 100))
 
     sl = max(round(lp - 1.5 * atr_v, 0), round(float(df["low"].tail(10).min()) * 0.97, 0))
@@ -416,19 +456,18 @@ def compute_signal_v1(df, ticker: str, ihsg_df, regime: dict, ticker_sector_map:
         "rs_interp": rs["interp"],
         "smart_money_notes": sm_data["notes"],
         "sector_notes": sec_data["notes"],
+        "gate_notes": gate_reason,
         "fund_ok": fund["pass"], "fund_penalty": fund["penalty"],
         "signal_type": "STRONG_BUY" if final >= 78 else "BUY",
         "session": "", "ticker": ticker
     }
-    
+
 # ══════════════════════════════════════════════════════
 #  DATABASE INJECTION & JSON VALIDATION
 # ══════════════════════════════════════════════════════
 
 def safe_float(val):
-    """PERBAIKAN: Mengamankan NaN agar tidak menabrak validasi JSONB PostgreSQL."""
-    if val is None or pd.isna(val) or np.isnan(val):
-        return None
+    if val is None or pd.isna(val) or np.isnan(val): return None
     return float(val)
 
 def save_analytics_to_db(candidates):
@@ -444,6 +483,7 @@ def save_analytics_to_db(candidates):
             );
         """))
         conn.execute(text("ALTER TABLE analytics_daily_signals ADD COLUMN IF NOT EXISTS sector_score INT;"))
+        conn.execute(text("ALTER TABLE analytics_daily_signals ADD COLUMN IF NOT EXISTS gate_notes TEXT;"))
 
     raw_conn = storage._get_raw_conn()
     try:
@@ -456,7 +496,6 @@ def save_analytics_to_db(candidates):
                 sec_score = c.get('sec_score', 50)
                 fund_pen = c.get('fund_penalty', 0)
                 
-                # PERBAIKAN: Menghilangkan Double-Counting, murni mengandalkan composite yang sudah berbobot
                 base_prob = float(comp_score) * 1.0 
                 ml_win_prob = min(99.0, max(1.0, base_prob))
                 if ml_win_prob >= 65: ml_label = "WIN"
@@ -470,22 +509,24 @@ def save_analytics_to_db(candidates):
                     "wyckoff_phase": c.get("wp"), 
                     "vcp_grade": c.get("vcp_grade"),
                     "smart_money_notes": c.get("smart_money_notes"),
-                    "sector_notes": c.get("sector_notes")
+                    "sector_notes": c.get("sector_notes"),
+                    "gate_notes": c.get("gate_notes")
                 }
                 query = """
                 INSERT INTO analytics_daily_signals
-                (date, ticker, ml_win_prob, composite_score, technical_score, smart_money_score, sector_score, fundamental_score, ml_label, features_snapshot)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                (date, ticker, ml_win_prob, composite_score, technical_score, smart_money_score, sector_score, fundamental_score, ml_label, features_snapshot, gate_notes)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (date, ticker) DO UPDATE SET
                     ml_win_prob = EXCLUDED.ml_win_prob, composite_score = EXCLUDED.composite_score,
                     technical_score = EXCLUDED.technical_score, smart_money_score = EXCLUDED.smart_money_score,
                     sector_score = EXCLUDED.sector_score, fundamental_score = EXCLUDED.fundamental_score,
                     ml_label = EXCLUDED.ml_label, features_snapshot = EXCLUDED.features_snapshot,
+                    gate_notes = EXCLUDED.gate_notes,
                     updated_at = CURRENT_TIMESTAMP;
                 """
                 cur.execute(query, (
                     today, c['ticker'], ml_win_prob, comp_score, ts_score, sm_score, sec_score, 
-                    100 - fund_pen, ml_label, json.dumps(features)
+                    100 - fund_pen, ml_label, json.dumps(features), c.get("gate_notes", "")
                 ))
             raw_conn.commit()
         print(f"\n  💾 [DB] Berhasil menyimpan {len(candidates)} setup analitik ke PostgreSQL.")
@@ -499,7 +540,7 @@ def save_analytics_to_db(candidates):
 # ══════════════════════════════════════════════════════
 
 def _scan_tickers(tickers, session, ihsg_df, regime, threshold, ticker_sector_map, sector_indices) -> tuple:
-    candidates, all_calculated, blocked_log = [], [], []
+    candidates, all_calculated = [], []
     for tk in tickers:
         try:
             df = load_price_from_db(tk)
@@ -508,8 +549,6 @@ def _scan_tickers(tickers, session, ihsg_df, regime, threshold, ticker_sector_ma
             lp = float(df["close"].iloc[-1])
             vol_today = float(df["volume"].iloc[-1])
             
-            # PERBAIKAN: Nilai transaksi (Turnover) menggunakan kolom 'value' dari tabel prices
-            # Jika 0 (karena diisi yfinance), gunakan perkiraan matematis (Harga * Volume * 100)
             turnover = float(df["value"].iloc[-1])
             if turnover == 0:
                 turnover = lp * vol_today * 100
@@ -518,32 +557,27 @@ def _scan_tickers(tickers, session, ihsg_df, regime, threshold, ticker_sector_ma
 
             is_pump, pump_reason = is_goreng_pump(df)
             if is_pump:
-                r = {"ticker": tk, "score": 0, "signal_type": "BLOCKED", "reason": pump_reason}
+                r = {"ticker": tk, "score": 0, "signal_type": "BLOCKED", "reason": pump_reason, "wp": "PUMP", "gate_notes": pump_reason}
                 all_calculated.append(r)
                 continue
 
             r = compute_signal_v1(df, tk, ihsg_df, regime, ticker_sector_map, sector_indices)
             if r is None: continue
-            if r.get("blocked"):
-                blocked_log.append(f"  ⛔ {tk}: {r['reason']}")
-                r["score"] = 0; r["signal_type"] = "BLOCKED"
-                all_calculated.append(r); continue
-
-            r["session"] = session
+            
             all_calculated.append(r)
             if r["score"] >= threshold:
                 candidates.append(r)
-                print(f"  ✅ {tk}: {r['score']}/100 | {r['signal_type']} | SM:{r['sm_score']} | Sec:{r['sec_score']} | {r['smart_money_notes']} | {r['sector_notes']}")
+                print(f"  ✅ {tk}: {r['score']}/100 | {r['signal_type']} | SM:{r['sm_score']} | Sec:{r['sec_score']} | {r['smart_money_notes']} | {r['sector_notes']} | Gates: {r['gate_notes']}")
             else:
-                print(f"  ℹ️ {tk}: Skor {r['score']} di bawah threshold ({threshold}).")
+                print(f"  ℹ️ {tk}: Skor {r['score']} di bawah threshold ({threshold}). Gates: {r['gate_notes']}")
             time.sleep(0.05)
         except Exception as e:
             print(f"  ❌ {tk}: ERROR - {e}")
-    return candidates, all_calculated, blocked_log
+    return candidates, all_calculated
 
 def scan_once(session: str = "DB_SCAN") -> list:
     print(f"\n{'='*58}")
-    print(f"Signal v1.1 (DB Native, Smart Money & Sector Rotation) — {session}")
+    print(f"Signal v1.2 (Soft Gates & Big Cap Compensation) — {session}")
     print(f"{'='*58}")
 
     ihsg_df = load_ihsg_from_db()
@@ -568,7 +602,7 @@ def scan_once(session: str = "DB_SCAN") -> list:
     tickers_to_scan = universe_mod.get_universe("all")
     print(f"📋 Total {len(tickers_to_scan)} saham akan di-scan.\n")
     
-    candidates, all_calc, blocked = _scan_tickers(tickers_to_scan, session, ihsg_df, regime, threshold, ticker_sector_map, sector_indices)
+    candidates, all_calc = _scan_tickers(tickers_to_scan, session, ihsg_df, regime, threshold, ticker_sector_map, sector_indices)
     
     if all_calc: save_analytics_to_db(all_calc)
 

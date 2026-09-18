@@ -56,7 +56,14 @@ def load_price_from_db(ticker: str, days: int = 365) -> pd.DataFrame | None:
         
         # PERBAIKAN: Menarik kolom "value" secara presisi untuk filter Turnover
         df = df.rename(columns={"open": "open", "high": "high", "low": "low", "close": "close", "volume": "volume", "value": "value"})
-        df = df[["date", "open", "high", "low", "close", "volume", "value"]].dropna()
+        df = df[["date", "open", "high", "low", "close", "volume", "value"]]
+        
+        # PERBAIKAN: Dropna HANYA untuk kolom wajib (OHLCV), agar saham yfinance (yang valuenya None) tidak ikut terbuang
+        df = df.dropna(subset=["date", "open", "high", "low", "close", "volume"])
+        
+        # PERBAIKAN: Isi kolom value yang kosong (None) dengan 0 agar tidak error saat di-convert ke float
+        df["value"] = df["value"].fillna(0)
+        
         df = df.sort_values("date").reset_index(drop=True)
         if df["volume"].median() > 5e8: df["volume"] = df["volume"] / 100
         return df
@@ -487,7 +494,11 @@ def _scan_tickers(tickers, session, ihsg_df, regime, threshold, ticker_sector_ma
             vol_today = float(df["volume"].iloc[-1])
             
             # PERBAIKAN: Nilai transaksi (Turnover) menggunakan kolom 'value' dari tabel prices
+            # Jika 0 (karena diisi yfinance), gunakan perkiraan matematis (Harga * Volume * 100)
             turnover = float(df["value"].iloc[-1])
+            if turnover == 0:
+                turnover = lp * vol_today * 100
+                
             if lp < MIN_PRICE_IDR or vol_today < MIN_VOLUME_LOT or turnover < MIN_TURNOVER_IDR: continue
 
             is_pump, pump_reason = is_goreng_pump(df)

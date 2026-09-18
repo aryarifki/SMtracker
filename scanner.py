@@ -1,12 +1,6 @@
 """
-Signal v1 — DB Native, Smart Money & Sector Rotation
+Signal v1.1 — DB Native, Smart Money, Sector Rotation & Data Validation
 ======================================================================
-Perubahan utama:
-- PURE ALGORITHMIC: Menghapus Ticker Blacklist/Penalty/Bonus manual.
-  Semua saham dinilai murni dari perhitungan Teknikal, Smart Money, dan Sektor.
-- SECTOR ROTATION: Mengecek tren index sektoral (IDXENERGY, IDXFINANCE, dll).
-- FULL DB INTEGRATION: Harga, Fundamental, & Sektor diambil dari PostgreSQL.
-- SCAN SEMUA SAHAM: Universe 'all' otomatis di-scan.
 """
 
 import os
@@ -38,24 +32,15 @@ MIN_TURNOVER_IDR = 500_000_000  # Minimal nilai transaksi harian Rp 500 Juta
 
 # ── MAPPING NAMA SEKTOR (DB) KE KODE INDEX (DB) ──
 SECTOR_INDEX_MAP = {
-    "ENERGI": "IDXENERGY",
-    "ENERGY": "IDXENERGY",
-    "BARANG BAKU": "IDXBASIC",
-    "BASIC MATERIALS": "IDXBASIC",
-    "KEUANGAN": "IDXFINANCE",
-    "FINANCIALS": "IDXFINANCE",
-    "KESEHATAN": "IDXHEALTH",
-    "HEALTH CARE": "IDXHEALTH",
-    "INDUSTRI": "IDXINDUST",
-    "INDUSTRIALS": "IDXINDUST",
-    "PROPERTI": "IDXPROPERT",
-    "REAL ESTATE": "IDXPROPERT",
-    "INFRASTRUKTUR": "IDXINFRA",
-    "INFRASTRUCTURE": "IDXINFRA",
-    "TRANSPORTASI": "IDXTRANS",
-    "TRANSPORTATION": "IDXTRANS",
-    "TEKNOLOGI": "IDXTECHNO",
-    "TECHNOLOGY": "IDXTECHNO"
+    "ENERGI": "IDXENERGY", "ENERGY": "IDXENERGY",
+    "BARANG BAKU": "IDXBASIC", "BASIC MATERIALS": "IDXBASIC",
+    "KEUANGAN": "IDXFINANCE", "FINANCIALS": "IDXFINANCE",
+    "KESEHATAN": "IDXHEALTH", "HEALTH CARE": "IDXHEALTH",
+    "INDUSTRI": "IDXINDUST", "INDUSTRIALS": "IDXINDUST",
+    "PROPERTI": "IDXPROPERT", "REAL ESTATE": "IDXPROPERT",
+    "INFRASTRUKTUR": "IDXINFRA", "INFRASTRUCTURE": "IDXINFRA",
+    "TRANSPORTASI": "IDXTRANS", "TRANSPORTATION": "IDXTRANS",
+    "TEKNOLOGI": "IDXTECHNO", "TECHNOLOGY": "IDXTECHNO"
 }
 
 # ══════════════════════════════════════════════════════
@@ -68,8 +53,10 @@ def load_price_from_db(ticker: str, days: int = 365) -> pd.DataFrame | None:
         start_date = end_date - timedelta(days=days)
         df = storage.read_prices(tickers=[ticker], start_date=start_date, end_date=end_date)
         if df is None or df.empty or len(df) < 20: return None
-        df = df.rename(columns={"open": "open", "high": "high", "low": "low", "close": "close", "volume": "volume"})
-        df = df[["date", "open", "high", "low", "close", "volume"]].dropna()
+        
+        # PERBAIKAN: Menarik kolom "value" secara presisi untuk filter Turnover
+        df = df.rename(columns={"open": "open", "high": "high", "low": "low", "close": "close", "volume": "volume", "value": "value"})
+        df = df[["date", "open", "high", "low", "close", "volume", "value"]].dropna()
         df = df.sort_values("date").reset_index(drop=True)
         if df["volume"].median() > 5e8: df["volume"] = df["volume"] / 100
         return df
@@ -101,7 +88,6 @@ def load_ihsg_from_db(days: int = 365) -> pd.DataFrame | None:
         return None
 
 def load_all_sector_indices(days: int = 365) -> dict:
-    """Ambil data history semua index sektoral sekaligus untuk efisiensi."""
     sector_dfs = {}
     try:
         end_date = datetime.now().date()
@@ -115,33 +101,25 @@ def load_all_sector_indices(days: int = 365) -> dict:
             df = pd.read_sql(q, conn, params={"start": start_date, "end": end_date})
             
         if df.empty: return sector_dfs
-        
         for code, group in df.groupby("index_code"):
-            if len(group) >= 20: # Minimal 20 hari untuk MA20
+            if len(group) >= 20: 
                 sector_dfs[code] = group.sort_values("date").reset_index(drop=True)
         return sector_dfs
-    except Exception:
-        return sector_dfs
+    except Exception: return sector_dfs
 
 def get_ticker_sectors() -> dict:
-    """Ambil mapping ticker -> sektor dari DB."""
     try:
         q = text("SELECT ticker, sector FROM tickers WHERE is_active = TRUE")
         with storage.engine.connect() as conn:
             df = pd.read_sql(q, conn)
         if df.empty: return {}
         return dict(zip(df['ticker'], df['sector']))
-    except Exception:
-        return {}
+    except Exception: return {}
 
 def get_sector_score(ticker: str, ticker_sector: str, sector_indices: dict) -> dict:
-    """Hitung skor sektor berdasarkan MA50/MA20 index sektoral."""
-    if not ticker_sector or not sector_indices:
-        return {"score": 50, "notes": "No Sector Data"}
-        
+    if not ticker_sector or not sector_indices: return {"score": 50, "notes": "No Sector Data"}
     sector_upper = ticker_sector.upper()
     target_index_code = None
-    
     for key, idx_code in SECTOR_INDEX_MAP.items():
         if key in sector_upper:
             target_index_code = idx_code
@@ -154,18 +132,14 @@ def get_sector_score(ticker: str, ticker_sector: str, sector_indices: dict) -> d
     lp = float(df_sec["close"].iloc[-1])
     
     if len(df_sec) >= 50:
-        ma = float(df_sec["close"].rolling(50).mean().iloc[-1])
-        ma_label = "MA50"
+        ma, ma_label = float(df_sec["close"].rolling(50).mean().iloc[-1]), "MA50"
     elif len(df_sec) >= 20:
-        ma = float(df_sec["close"].rolling(20).mean().iloc[-1])
-        ma_label = "MA20"
+        ma, ma_label = float(df_sec["close"].rolling(20).mean().iloc[-1]), "MA20"
     else:
         return {"score": 50, "notes": "Data Sektor Kurang"}
     
-    if lp > ma:
-        return {"score": 70, "notes": f"Sektor Uptrend (>{target_index_code} {ma_label})"}
-    else:
-        return {"score": 30, "notes": f"Sektor Downtrend (<{target_index_code} {ma_label})"}
+    if lp > ma: return {"score": 70, "notes": f"Sektor Uptrend (>{target_index_code} {ma_label})"}
+    return {"score": 30, "notes": f"Sektor Downtrend (<{target_index_code} {ma_label})"}
 
 def quick_fundamental_check_from_db(ticker: str) -> dict:
     try:
@@ -211,11 +185,11 @@ def get_smart_money_score(ticker: str) -> dict:
     except Exception: return {"score": 50, "notes": "No SM Data"}
 
 # ══════════════════════════════════════════════════════
-#  TECHNICAL INDICATORS
+#  TECHNICAL INDICATORS & SCORING ENGINE
 # ══════════════════════════════════════════════════════
 
 def cmf(df, p=14):
-    hl  = df["high"] - df["low"]
+    hl = df["high"] - df["low"]
     clv = ((df["close"] - df["low"]) - (df["high"] - df["close"])) / hl.replace(0, np.nan)
     return (clv * df["volume"]).rolling(p).sum() / df["volume"].rolling(p).sum()
 
@@ -223,16 +197,14 @@ def obv(df):
     return (np.sign(df["close"].diff()).fillna(0) * df["volume"]).cumsum()
 
 def mfi(df, p=14):
-    tp  = (df["high"] + df["low"] + df["close"]) / 3
-    mf  = tp * df["volume"]
+    tp = (df["high"] + df["low"] + df["close"]) / 3
+    mf = tp * df["volume"]
     pos = mf.where(tp > tp.shift(1), 0).rolling(p).sum()
     neg = mf.where(tp < tp.shift(1), 0).rolling(p).sum()
     return (100 - 100 / (1 + pos / neg.replace(0, np.nan))).fillna(50)
 
 def atr(df, p=14):
-    hl = df["high"] - df["low"]
-    hc = (df["high"] - df["close"].shift()).abs()
-    lc = (df["low"]  - df["close"].shift()).abs()
+    hl, hc, lc = df["high"] - df["low"], (df["high"] - df["close"].shift()).abs(), (df["low"]  - df["close"].shift()).abs()
     return pd.concat([hl, hc, lc], axis=1).max(axis=1).rolling(p).mean()
 
 def rsi(s, p=14):
@@ -260,8 +232,7 @@ def wyckoff_phase(df, c, o):
     broke = p_min10 <= p_min20 * 1.002
     recov = float(p.iloc[-1]) > float(p.tail(5).min()) * 1.015
     lookback = min(180, n)
-    v_lb = vol.iloc[-lookback:]
-    v_ma_lb = v_lb.rolling(20).mean()
+    v_lb, v_ma_lb = vol.iloc[-lookback:], vol.iloc[-lookback:].rolling(20).mean()
     vol_hist = (v_lb / v_ma_lb.replace(0, np.nan)).fillna(0)
     p_lb = p.iloc[-lookback:]
     had_a = bool((vol_hist >= 2.5).any() and (p_lb.iloc[0] - p_lb.min()) / (p_lb.iloc[0] + 1) > 0.06)
@@ -289,7 +260,6 @@ def detect_vcp_grade(df) -> str:
     return "NONE"
 
 def is_goreng_pump(df, pump_thresh: float = 15.0, vol_thresh: float = 5.0) -> tuple:
-    """Deteksi saham gorengan yang naik terlalu cepat dalam 3 hari."""
     if df is None or len(df) < 5: return False, ""
     lp = float(df["close"].iloc[-1])
     p3ago = float(df["close"].iloc[-min(4, len(df)-1)])
@@ -298,16 +268,10 @@ def is_goreng_pump(df, pump_thresh: float = 15.0, vol_thresh: float = 5.0) -> tu
     vol_ma = float(vol.rolling(20).mean().iloc[-1]) if len(df) >= 20 else float(vol.mean())
     vr = float(vol.iloc[-1]) / (vol_ma + 1)
     
-    if ret3 > pump_thresh and vr > 2.5:
-        return True, f"Pump: +{ret3:.1f}% dalam 3 hari, volume {vr:.1f}x"
-    if vr > vol_thresh:
-        return True, f"Volume spike ekstrem {vr:.1f}x tanpa fundamental"
+    if ret3 > pump_thresh and vr > 2.5: return True, f"Pump: +{ret3:.1f}% dalam 3 hari, volume {vr:.1f}x"
+    if vr > vol_thresh: return True, f"Volume spike ekstrem {vr:.1f}x tanpa fundamental"
     return False, ""
     
-# ══════════════════════════════════════════════════════
-#  SCORING ENGINE
-# ══════════════════════════════════════════════════════
-
 def check_hard_gates(df, wp, cmf_v, mfi_v, obv_s, vr, regime=None) -> tuple:
     n, p = len(df), df["close"]
     if wp == "A": return False, "Phase A (Selling Climax) — bukan area entry"
@@ -402,14 +366,13 @@ def compute_signal_v1(df, ticker: str, ihsg_df, regime: dict, ticker_sector_map:
     fund = quick_fundamental_check_from_db(ticker)
     sec_data = get_sector_score(ticker, ticker_sector_map.get(ticker, ""), sector_indices)
 
-    # Weighted Composite (Total 100%) - Murni Algoritma
     raw = int(np.clip(round(
-        ts * 0.30 +               # Teknikal 30%
-        sm_data["score"] * 0.30 + # Smart Money 30%
-        sec_data["score"] * 0.15 + # Sektor Rotation 15%
-        vcp_s * 0.10 +           # VCP 10%
-        rs["score"] * 0.10 +     # RS vs IHSG 10%
-        50 * 0.05                # Base 5%
+        ts * 0.30 +               
+        sm_data["score"] * 0.30 + 
+        sec_data["score"] * 0.15 + 
+        vcp_s * 0.10 +           
+        rs["score"] * 0.10 +     
+        50 * 0.05                
     ), 0, 100))
 
     raw = raw + phase_bonus - fund["penalty"]
@@ -437,8 +400,14 @@ def compute_signal_v1(df, ticker: str, ihsg_df, regime: dict, ticker_sector_map:
     }
 
 # ══════════════════════════════════════════════════════
-#  DATABASE INJECTION
+#  DATABASE INJECTION & JSON VALIDATION
 # ══════════════════════════════════════════════════════
+
+def safe_float(val):
+    """PERBAIKAN: Mengamankan NaN agar tidak menabrak validasi JSONB PostgreSQL."""
+    if val is None or pd.isna(val) or np.isnan(val):
+        return None
+    return float(val)
 
 def save_analytics_to_db(candidates):
     if not candidates: return
@@ -452,7 +421,6 @@ def save_analytics_to_db(candidates):
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (date, ticker)
             );
         """))
-        # Tambah kolom sector_score jika belum ada
         conn.execute(text("ALTER TABLE analytics_daily_signals ADD COLUMN IF NOT EXISTS sector_score INT;"))
 
     raw_conn = storage._get_raw_conn()
@@ -466,15 +434,19 @@ def save_analytics_to_db(candidates):
                 sec_score = c.get('sec_score', 50)
                 fund_pen = c.get('fund_penalty', 0)
                 
-                base_prob = float(comp_score) * 0.50 + float(sm_score) * 0.30 + float(sec_score) * 0.20
+                # PERBAIKAN: Menghilangkan Double-Counting, murni mengandalkan composite yang sudah berbobot
+                base_prob = float(comp_score) * 1.0 
                 ml_win_prob = min(99.0, max(1.0, base_prob))
                 if ml_win_prob >= 65: ml_label = "WIN"
                 elif ml_win_prob >= 40: ml_label = "HOLD"
                 else: ml_label = "LOSS"
 
                 features = {
-                    "cmf": c.get("cmf_v"), "rsi": c.get("rsi_v"), "mfi": c.get("mfi_v"),
-                    "wyckoff_phase": c.get("wp"), "vcp_grade": c.get("vcp_grade"),
+                    "cmf": safe_float(c.get("cmf_v")), 
+                    "rsi": safe_float(c.get("rsi_v")), 
+                    "mfi": safe_float(c.get("mfi_v")),
+                    "wyckoff_phase": c.get("wp"), 
+                    "vcp_grade": c.get("vcp_grade"),
                     "smart_money_notes": c.get("smart_money_notes"),
                     "sector_notes": c.get("sector_notes")
                 }
@@ -514,18 +486,12 @@ def _scan_tickers(tickers, session, ihsg_df, regime, threshold, ticker_sector_ma
             lp = float(df["close"].iloc[-1])
             vol_today = float(df["volume"].iloc[-1])
             
-            # Filter Likuiditas (Minimal Harga & Volume)
-            if lp < MIN_PRICE_IDR or vol_today < MIN_VOLUME_LOT: continue
-                
-            # Filter Nilai Transaksi (Turnover)
-            # Karena volume sudah dinormalisasi ke lot, turnover = harga * volume * 100 (1 lot = 100 lembar)
-            turnover = lp * vol_today * 100
-            if turnover < MIN_TURNOVER_IDR: continue
+            # PERBAIKAN: Nilai transaksi (Turnover) menggunakan kolom 'value' dari tabel prices
+            turnover = float(df["value"].iloc[-1])
+            if lp < MIN_PRICE_IDR or vol_today < MIN_VOLUME_LOT or turnover < MIN_TURNOVER_IDR: continue
 
-            # Filter Gorengan / Pump and Dump
             is_pump, pump_reason = is_goreng_pump(df)
             if is_pump:
-                # Jika terdeteksi gorengan, masuk daftar hitam tapi skornya 0
                 r = {"ticker": tk, "score": 0, "signal_type": "BLOCKED", "reason": pump_reason}
                 all_calculated.append(r)
                 continue
@@ -551,7 +517,7 @@ def _scan_tickers(tickers, session, ihsg_df, regime, threshold, ticker_sector_ma
 
 def scan_once(session: str = "DB_SCAN") -> list:
     print(f"\n{'='*58}")
-    print(f"Signal v1 (DB Native, Smart Money & Sector Rotation) — {session}")
+    print(f"Signal v1.1 (DB Native, Smart Money & Sector Rotation) — {session}")
     print(f"{'='*58}")
 
     ihsg_df = load_ihsg_from_db()

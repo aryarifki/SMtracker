@@ -18,6 +18,9 @@ if str(_SRC) not in sys.path:
 
 from idx_bandarmology import storage
 
+# Import modul Telegram Bot
+import telegram_bot
+
 MAX_HOLD_DAYS = 20 # Maksimal hari menahan saham (Trading Days)
 
 def get_open_signals():
@@ -94,14 +97,40 @@ def audit_signals():
 
         if hit_tp:
             update_signal_status(sig_id, "WIN", exit_price, exit_date, days_held)
+            
+            # ── KIRIM NOTIFIKASI TELEGRAM ──
+            try:
+                msg = telegram_bot.format_audit_message("WIN", ticker, float(entry), exit_price, days_held)
+                telegram_bot.send_message(msg)
+            except Exception as tg_err:
+                print(f"  ⚠️ [Telegram] Gagal kirim audit WIN {ticker}: {tg_err}")
+                
             print(f"  ✅ WIN  | {ticker} | Entry: {entry:,.0f} | TP: {tp:,.0f} | {days_held}d")
             wins += 1
+            
         elif hit_sl:
             update_signal_status(sig_id, "LOSS", exit_price, exit_date, days_held)
+            
+            # ── KIRIM NOTIFIKASI TELEGRAM ──
+            try:
+                msg = telegram_bot.format_audit_message("LOSS", ticker, float(entry), exit_price, days_held)
+                telegram_bot.send_message(msg)
+            except Exception as tg_err:
+                print(f"  ⚠️ [Telegram] Gagal kirim audit LOSS {ticker}: {tg_err}")
+                
             print(f"  ❌ LOSS | {ticker} | Entry: {entry:,.0f} | SL: {sl:,.0f} | {days_held}d")
             losses += 1
+            
         elif days_held >= MAX_HOLD_DAYS:
             update_signal_status(sig_id, "EXPIRED", exit_price, exit_date, days_held)
+            
+            # ── KIRIM NOTIFIKASI TELEGRAM ──
+            try:
+                msg = telegram_bot.format_audit_message("EXPIRED", ticker, float(entry), exit_price, days_held)
+                telegram_bot.send_message(msg)
+            except Exception as tg_err:
+                print(f"  ⚠️ [Telegram] Gagal kirim audit EXP {ticker}: {tg_err}")
+                
             print(f"  ⏰ EXP  | {ticker} | Entry: {entry:,.0f} | Exit: {exit_price:,.0f} | {days_held}d")
             expired += 1
 

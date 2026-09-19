@@ -6,6 +6,7 @@ Perubahan utama:
 - BIG CAP COMPENSATION: Saham LQ45/IDX80 mendapat bonus skor agar bisa bersaing dengan saham kecil.
 - FULL DB INTEGRATION: Harga, Fundamental, & Sektor diambil dari PostgreSQL.
 - AI DATA COLLECTION: Sinyal BUY otomatis dicatat ke tabel `signals` untuk dilatih oleh XGBoost nantinya.
+- TELEGRAM NOTIF: Sinyal BUY baru otomatis dikirim ke bot Telegram.
 """
 
 import os
@@ -26,6 +27,9 @@ if str(_SRC) not in sys.path:
 
 from idx_bandarmology import storage, config, universe as universe_mod
 from sqlalchemy import text
+
+# Import modul Telegram Bot
+import telegram_bot
 
 warnings.filterwarnings("ignore")
 
@@ -608,6 +612,14 @@ def _scan_tickers(tickers, session, ihsg_df, regime, threshold, ticker_sector_ma
                 candidates.append(r)
                 # Catat sinyal ke tabel signals untuk AI Training
                 log_signal_to_db(r)
+                
+                # ── KIRIM NOTIFIKASI TELEGRAM ──
+                try:
+                    msg = telegram_bot.format_signal_message(r)
+                    telegram_bot.send_message(msg)
+                except Exception as tg_err:
+                    print(f"  ⚠️ [Telegram] Gagal kirim sinyal {tk}: {tg_err}")
+                
                 print(f"  ✅ {tk}: {r['score']}/100 | {r['signal_type']} | SM:{r['sm_score']} | Sec:{r['sec_score']} | {r['smart_money_notes']} | {r['sector_notes']} | Gates: {r['gate_notes']}")
             else:
                 print(f"  ℹ️ {tk}: Skor {r['score']} di bawah threshold ({threshold}). Gates: {r['gate_notes']}")

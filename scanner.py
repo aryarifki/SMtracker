@@ -398,7 +398,10 @@ def compute_signal_v1(df, ticker: str, ihsg_df, regime: dict, ticker_sector_map:
     obv_up = float(o_.iloc[-1]) > float(o_.iloc[-min(10, n-1)])
     av = float(df["volume"].tail(20).mean())
     vr = float(df["volume"].iloc[-1]) / av if av > 0 else 1.0
-    if atr_v == 0: return None
+    
+    # ── FILTER SAHAM MATI / SUSPEND ──
+    if atr_v <= 0 or lp <= 0:
+        return None
 
     # ── HITUNG TURNOVER SEBELUM SOFT GATES ──
     avg_turnover = float(df["value"].tail(20).mean())
@@ -445,7 +448,18 @@ def compute_signal_v1(df, ticker: str, ihsg_df, regime: dict, ticker_sector_map:
     final = int(np.clip(round(raw * regime.get("multiplier", 1.0)), 0, 100))
 
     sl = max(round(lp - 1.5 * atr_v, 0), round(float(df["low"].tail(10).min()) * 0.97, 0))
+    
+    # ── ANTI BUG SUSPEND/0 VOLUME ──
+    # Jika SL 0 atau sama dengan harga (saham mati/suspend), paksa SL ke -5%
+    if sl <= 0 or sl >= lp:
+        sl = round(lp * 0.95, 0)
+        
     tp = round(lp + 2.5 * (lp - sl), 0)
+    
+    # Jika TP kejauhan (misal >50%), kecilkan agar masuk akal (maks +15%)
+    if (tp - lp) / lp > 0.50:
+        tp = round(lp * 1.15, 0)
+        
     sl_pct = (lp - sl) / lp * 100
     tp_pct = (tp  - lp) / lp * 100
 

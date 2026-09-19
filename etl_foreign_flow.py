@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """ETL Script: Hitung Analitik Foreign Flow (HMM, VAR, Heatmap, Network) 
-dan simpan ke tabel analytics_foreign_flow untuk Re-tracker."""
+dan simpan ke tabel analytics_foreign_flow untuk Re-tracker.
+Dilengkapi dengan pembersihan cache Redis otomatis di akhir eksekusi."""
 
 from __future__ import annotations
 
@@ -167,6 +168,21 @@ def process_ticker(ticker: str, lookback_days: int):
     elapsed = time.monotonic() - t0
     print(f"DONE ({elapsed:.2f}s)")
 
+def clear_redis_cache():
+    """Membersihkan cache Redis agar backend mengambil data fresh dari PostgreSQL."""
+    print("\n🧹 Memulai pembersihan cache Redis...")
+    try:
+        import redis
+        # Sesuaikan host, port, dan db Redis Anda jika berbeda
+        r = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+        r.flushdb()
+        print("✅ Redis cache berhasil dibersihkan (FLUSHDB). Backend akan mengambil data fresh.")
+    except ImportError:
+        print("⚠️ Library 'redis' tidak terinstal. Lewati pembersihan cache otomatis.")
+        print("   (Jika Anda menggunakan Redis, install via: pip install redis)")
+    except Exception as e:
+        print(f"⚠️ Gagal membersihkan Redis cache. Pastikan server Redis berjalan. Error: {e}")
+
 def main():
     parser = argparse.ArgumentParser(description="ETL Foreign Flow Analytics")
     parser.add_argument("--universe", default="watchlist", help="Universe ticker (misal: idx80, watchlist, all)")
@@ -189,6 +205,9 @@ def main():
                 print(f"ERROR ({e})")
                 
     print("\n✅ ETL Selesai. Data siap dikonsumsi Re-tracker.")
+    
+    # ── PURGE REDIS CACHE SETELAH ETL SELESAI ──
+    clear_redis_cache()
 
 if __name__ == "__main__":
     main()

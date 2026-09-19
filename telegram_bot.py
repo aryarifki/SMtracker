@@ -6,11 +6,16 @@ from datetime import datetime
 from sqlalchemy import text
 from idx_bandarmology import storage
 
-BOT_TOKEN = "8924668232:AAHakfMgHCt8YgLDN2TivsL-FJnSEi3NVX8"
-CHAT_ID = "-1004373620684"
+# Ambil Token dan Chat ID dari file .env
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 def send_message(text: str):
     """Mengirim pesan teks ke Telegram."""
+    if not BOT_TOKEN or not CHAT_ID:
+        print("  ⚠️ [Telegram] Token atau Chat ID belum diisi di .env")
+        return
+        
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": CHAT_ID,

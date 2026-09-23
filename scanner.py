@@ -647,6 +647,29 @@ def scan_once(session: str = "DB_SCAN") -> list:
     print(f"Signal v1.2 (Soft Gates & Big Cap Compensation) — {session}")
     print(f"{'='*58}")
 
+    # ── TIME GUARD: CEK KESEGARAN DATA ──
+    q_latest = text("SELECT MAX(date) FROM prices")
+    with storage.engine.connect() as conn:
+        latest_db_date_row = conn.execute(q_latest).fetchone()
+    
+    today = datetime.now().date()
+    if not latest_db_date_row or not latest_db_date_row[0]:
+        print("❌ ABORT: Tidak ada data harga di database. Jalankan backfill_daily.py terlebih dahulu!")
+        return []
+        
+    latest_db_date = latest_db_date_row[0]
+    if isinstance(latest_db_date, datetime):
+        latest_db_date = latest_db_date.date()
+
+    # Jika data terbaru di DB bukan hari ini (atau hari Jumat jika sekarang Sabtu/Minggu)
+    is_weekend = today.weekday() >= 5
+    expected_date = today if not is_weekend else today - timedelta(days=today.weekday() - 4)
+    
+    if latest_db_date < expected_date:
+        print(f"❌ ABORT: Data database usang! Tanggal terbaru di DB: {latest_db_date}. Harapan: {expected_date}.")
+        print("   Pastikan backfill_daily.py berjalan sukses sebelum scanner.py.")
+        return []
+    
     ihsg_df = load_ihsg_from_db()
     regime = get_market_regime(ihsg_df)
     print(f"🌏 {regime['regime']} — {regime['desc']}")

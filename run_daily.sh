@@ -1,6 +1,12 @@
 #!/bin/bash
 cd /root/SMtracker
 
+# ── PENTING: MUAT ENVIRONMENT VARIABLES DARI .ENV ──
+export $(grep -v '^#' .env | xargs)
+# Set path agar cronjob tahu di mana browser Playwright diinstal
+export PLAYWRIGHT_BROWSERS_PATH=/root/.cache/ms-playwright
+# ── AKHIR ENVIRONMENT SETUP ──
+
 # Pastikan folder debug tersedia
 mkdir -p /root/SMtracker/debug
 

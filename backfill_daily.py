@@ -177,9 +177,10 @@ def run_daily_backfill(universe_mode: str, rate_limit: float, days_back: int) ->
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Backfill broker data harian (IDX + Stockbit)")
-    # PERBAIKAN: Default universe diubah menjadi 'all' agar otomatis menarik 962 saham
+    # Default universe diubah menjadi 'all' agar otomatis menarik 962 saham
     parser.add_argument("--universe", default="all", help="Universe yang akan ditarik")
-    parser.add_argument("--days", type=int, default=3, help="Jumlah hari ke belakang")
+    # PERUBAHAN: Default days diubah menjadi 1 (hari ini dan 1 hari ke belakang)
+    parser.add_argument("--days", type=int, default=1, help="Jumlah hari ke belakang")
     parser.add_argument("--rate-limit", type=float, default=8.0)
     args = parser.parse_args()
     

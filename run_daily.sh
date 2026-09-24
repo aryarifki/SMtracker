@@ -30,7 +30,7 @@ fi
 # 1. BACKFILL DATA (IDX + STOCKBIT)
 # ==========================================
 echo "=== [1/4] Memulai Backfill Harian (Universe: ALL) pada $(date) ===" >> $LOG_BACKFILL
- $PYTHON_CMD backfill_daily.py --universe all --days 3 >> $LOG_BACKFILL 2>&1
+ $PYTHON_CMD backfill_daily.py --universe all >> $LOG_BACKFILL 2>&1
 echo "=== Selesai Backfill pada $(date) ===" >> $LOG_BACKFILL
 
 # ==========================================
